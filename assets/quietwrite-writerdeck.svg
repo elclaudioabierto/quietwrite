@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="28" stdDeviation="30" flood-color="#000" flood-opacity=".48"/>
+    </filter>
+  </defs>
+  <rect width="1600" height="1000" fill="#101114"/>
+  <circle cx="1370" cy="120" r="330" fill="#172134"/>
+  <circle cx="180" cy="910" r="370" fill="#161e19"/>
+  <text x="140" y="115" fill="#fff" font-family="Georgia, serif" font-size="54" font-weight="700">QuietWrite</text>
+  <text x="140" y="166" fill="#bfc5ce" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="25">A quiet place for the words that need one.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="140" y="220" width="1320" height="650" rx="18" fill="#000" stroke="#3a3d43" stroke-width="2"/>
+    <path d="M158 220h1284a18 18 0 0 1 18 18v50H140v-50a18 18 0 0 1 18-18z" fill="#25272c"/>
+    <circle cx="181" cy="254" r="9" fill="#ff5f57"/>
+    <circle cx="213" cy="254" r="9" fill="#febc2e"/>
+    <circle cx="245" cy="254" r="9" fill="#28c840"/>
+    <text x="800" y="263" text-anchor="middle" fill="#d7d9de" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="18">quietwrite — ~/Writing</text>
+  </g>
+
+  <g font-family="Menlo, Monaco, monospace">
+    <text x="800" y="360" text-anchor="middle" fill="#fff" font-size="31" font-weight="700">Choose a shelf</text>
+    <line x1="171" y1="392" x2="1429" y2="392" stroke="#777" stroke-width="2"/>
+
+    <rect x="190" y="420" width="1220" height="48" fill="#232323"/>
+    <text x="222" y="453" fill="#fff" font-size="24" font-weight="700">›  NOTES</text>
+    <text x="222" y="505" fill="#d2d2d2" font-size="24">   DRAFTS</text>
+    <text x="222" y="557" fill="#d2d2d2" font-size="24">   JOURNAL</text>
+    <text x="222" y="609" fill="#d2d2d2" font-size="24">   POEMS</text>
+    <text x="222" y="661" fill="#d2d2d2" font-size="24">   IDEAS</text>
+    <text x="222" y="713" fill="#d2d2d2" font-size="24">   SECRET THOUGHTS</text>
+    <text x="222" y="765" fill="#d2d2d2" font-size="24">   ARCHIVE</text>
+
+    <line x1="171" y1="790" x2="1429" y2="790" stroke="#444" stroke-width="2"/>
+    <text x="800" y="835" text-anchor="middle" fill="#d2d2d2" font-size="21">↑↓ choose  ·  Enter open  ·  F5 theme  ·  Ctrl+Q quit</text>
+  </g>
+
+  <text x="800" y="937" text-anchor="middle" fill="#e8e9eb" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="23">Plain Markdown  ·  Keyboard first  ·  Offline  ·  No telemetry</text>
+</svg>
