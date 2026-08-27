@@ -11,5 +11,5 @@ rustup target add "$TARGET"
 cargo test
 cargo build --release --target "$TARGET"
 mkdir -p dist
-cp "target/$TARGET/release/quietwrite" "dist/quietwrite-0.8.0-$TARGET"
-echo "Built dist/quietwrite-0.8.0-$TARGET"
+cp "target/$TARGET/release/quietwrite" "dist/quietwrite-$TARGET"
+echo "Built dist/quietwrite-$TARGET"

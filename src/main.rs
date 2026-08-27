@@ -4,7 +4,6 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use chrono::Local;
-use pulldown_cmark::{html, Options, Parser};
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -559,21 +558,9 @@ const BLANK_PROMPTS: &[&str] = &[
     "What wants saying?",
     "Begin before ready.",
 ];
-const CATEGORIES: &[(&str, &str)] = &[
-    ("Notes", "Notes"),
-    ("Drafts", "Drafts"),
-    ("Journal", "Journal"),
-    ("Poems", "Poems"),
-    ("Ideas", "Ideas"),
-    ("Projects", "Projects"),
-    ("Secret Thoughts", "Secret Thoughts"),
-    ("Archive", "Archive"),
-    ("Trash", ".quietwrite/Trash"),
-];
-const PROJECTS_CATEGORY_INDEX: usize = 5;
-const SECRET_CATEGORY_INDEX: usize = 6;
-const ARCHIVE_CATEGORY_INDEX: usize = 7;
-const TRASH_CATEGORY_INDEX: usize = 8;
+const CATEGORIES: &[(&str, &str)] = &[("Writing", "Notes"), ("Secret Thoughts", "Secret Thoughts")];
+const SECRET_CATEGORY_INDEX: usize = 1;
+const ORDINARY_FOLDERS: &[&str] = &["Notes", "Drafts", "Journal", "Poems", "Ideas", "Projects"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -592,11 +579,9 @@ enum LockPrompt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextPrompt {
     Rename,
-    SearchShelf,
+    SearchSpace,
     FindDraft,
     WordTarget,
-    NewProject,
-    NewChapter,
 }
 
 struct App {
@@ -624,7 +609,7 @@ struct App {
     secret_lock_path: PathBuf,
     text_prompt: Option<TextPrompt>,
     prompt_input: String,
-    shelf_search: String,
+    space_search: String,
     find_query: String,
     session_started: Instant,
     session_initial_words: usize,
@@ -700,7 +685,7 @@ impl App {
             secret_lock_path,
             text_prompt: None,
             prompt_input: String::new(),
-            shelf_search: String::new(),
+            space_search: String::new(),
             find_query: String::new(),
             session_started: Instant::now(),
             session_initial_words,
@@ -904,8 +889,8 @@ impl App {
 
     fn refresh_documents(&mut self) {
         self.documents = notes_for_category(&self.directory, self.category_index);
-        if !self.shelf_search.is_empty() {
-            let query = self.shelf_search.to_lowercase();
+        if !self.space_search.is_empty() {
+            let query = self.space_search.to_lowercase();
             let paths = std::mem::take(&mut self.documents);
             self.documents = paths
                 .into_iter()
@@ -1072,13 +1057,13 @@ impl App {
                     }
                 }
             }
-            TextPrompt::SearchShelf => {
-                self.shelf_search = input;
+            TextPrompt::SearchSpace => {
+                self.space_search = input;
                 self.refresh_documents();
-                self.message = if self.shelf_search.is_empty() {
+                self.message = if self.space_search.is_empty() {
                     "search cleared".into()
                 } else {
-                    format!("search: {}", self.shelf_search)
+                    format!("search: {}", self.space_search)
                 };
             }
             TextPrompt::FindDraft => {
@@ -1092,59 +1077,7 @@ impl App {
                     |target| format!("target: {target} words"),
                 );
             }
-            TextPrompt::NewProject => {
-                let name = safe_filename(&input);
-                if !name.is_empty() {
-                    let folder = self.category_directory(PROJECTS_CATEGORY_INDEX).join(&name);
-                    fs::create_dir_all(&folder)?;
-                    atomic_write(
-                        &folder.join("00-title-page.md"),
-                        format!("# {name}\n\n**Author Name**\n").as_bytes(),
-                    )?;
-                    atomic_write(
-                        &folder.join("01-copyright.md"),
-                        "# Copyright\n\nCopyright © YEAR Author Name\n\nAll rights reserved.\n\nISBN: \n".as_bytes(),
-                    )?;
-                    let path = folder.join("10-chapter-1.md");
-                    atomic_write(&path, b"# Chapter 1\n\n")?;
-                    atomic_write(
-                        &folder.join("90-about-the-author.md"),
-                        b"# About the Author\n\n",
-                    )?;
-                    self.open_path(path)?;
-                    self.message = format!("book: {name}");
-                }
-            }
-            TextPrompt::NewChapter => {
-                let name = safe_filename(&input);
-                if !name.is_empty() {
-                    let projects = self.category_directory(PROJECTS_CATEGORY_INDEX);
-                    let folder = self
-                        .selected_path()
-                        .and_then(|path| path.parent().map(Path::to_path_buf))
-                        .filter(|path| path.starts_with(&projects))
-                        .unwrap_or(projects);
-                    fs::create_dir_all(&folder)?;
-                    let filename = format!("{name}.md");
-                    let path = unique_destination(&folder, std::ffi::OsStr::new(&filename));
-                    atomic_write(&path, format!("# {name}\n\n").as_bytes())?;
-                    self.open_path(path)?;
-                    self.message = format!("chapter: {name}");
-                }
-            }
         }
-        Ok(())
-    }
-
-    fn open_path(&mut self, path: PathBuf) -> io::Result<()> {
-        self.save()?;
-        let text = self.read_document(&path)?;
-        self.document = Document::from_string(text);
-        self.path = path;
-        self.scroll = 0;
-        self.screen = Screen::Editor;
-        self.session_started = Instant::now();
-        self.session_initial_words = self.document.word_count();
         Ok(())
     }
 
@@ -1183,61 +1116,6 @@ impl App {
             self.screen = Screen::Editor;
             self.message = "reference opened".into();
         }
-        Ok(())
-    }
-
-    fn selected_project_root(&self) -> Option<PathBuf> {
-        let projects = self.category_directory(PROJECTS_CATEGORY_INDEX);
-        let selected = self.selected_path()?;
-        let relative = selected.strip_prefix(&projects).ok()?;
-        let project_name = relative.components().next()?;
-        Some(projects.join(project_name))
-    }
-
-    fn export_selected_book(&mut self) -> io::Result<()> {
-        let Some(project) = self.selected_project_root() else {
-            self.message = "Select a chapter inside a book project".into();
-            return Ok(());
-        };
-        let title = project
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Untitled Book");
-        let mut chapters = Vec::new();
-        collect_markdown(&project, true, &mut chapters);
-        chapters.sort();
-        if chapters.is_empty() {
-            self.message = "This book has no chapters".into();
-            return Ok(());
-        }
-
-        let mut markdown = String::new();
-        for (index, chapter) in chapters.iter().enumerate() {
-            if index > 0 {
-                markdown.push_str("\n\n---\n\n");
-            }
-            markdown.push_str(&fs::read_to_string(chapter)?);
-            if !markdown.ends_with('\n') {
-                markdown.push('\n');
-            }
-        }
-
-        let parser = Parser::new_ext(&markdown, Options::all());
-        let mut body = String::new();
-        html::push_html(&mut body, parser);
-        let escaped_title = html_escape(title);
-        let document = format!(
-            "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{escaped_title}</title><style>body{{font-family:serif;line-height:1.5;max-width:42em;margin:auto}}h1{{page-break-before:always;text-align:center;margin-top:20%}}h1:first-child{{page-break-before:avoid}}hr{{page-break-after:always;border:0}}p{{orphans:2;widows:2}}</style></head><body>\n{body}\n</body></html>\n"
-        );
-        let export_folder = self.directory.join("Exports").join(safe_filename(title));
-        fs::create_dir_all(&export_folder)?;
-        atomic_write(&export_folder.join("manuscript.md"), markdown.as_bytes())?;
-        atomic_write(&export_folder.join("manuscript.html"), document.as_bytes())?;
-        atomic_write(
-            &export_folder.join("KDP-README.txt"),
-            b"manuscript.html: upload to KDP as a reflowable eBook or no-bleed paperback manuscript.\nmanuscript.md: portable combined source and conversion input.\nAlways inspect the result in Kindle Previewer or KDP Print Previewer before publishing.\n",
-        )?;
-        self.message = format!("Exported {title} to Exports");
         Ok(())
     }
 
@@ -1292,52 +1170,13 @@ impl App {
         Ok(())
     }
 
-    fn move_selected_to(&mut self, category: usize) -> io::Result<()> {
-        if let Some(path) = self.selected_path() {
-            let folder = self.category_directory(category);
-            fs::create_dir_all(&folder)?;
-            let destination = unique_destination(&folder, path.file_name().unwrap_or_default());
-            if self.is_secret_path(&path) && !self.is_secret_path(&destination) {
-                self.message = "Secret Thoughts cannot leave the encrypted shelf".into();
-                return Ok(());
-            }
-            let crosses_secret_boundary =
-                self.is_secret_path(&path) != self.is_secret_path(&destination);
-            if self.is_secret_path(&destination) && self.secret_key.is_none() {
-                self.message = "Unlock Secret Thoughts before moving a note there".into();
-                return Ok(());
-            }
-            if crosses_secret_boundary {
-                let plaintext = self.read_document_bytes(&path)?;
-                self.write_document(&destination, &plaintext)?;
-                fs::remove_file(&path)?;
-            } else {
-                fs::rename(&path, &destination)?;
-            }
-            if self.pinned.remove(&path) {
-                self.pinned.insert(destination.clone());
-                self.save_pins()?;
-            }
-            self.category_index = category;
-            self.shelf_search.clear();
-            self.refresh_documents();
-            self.document_index = self
-                .documents
-                .iter()
-                .position(|candidate| candidate == &destination)
-                .unwrap_or(0);
-            self.message = format!("Moved safely to {}", CATEGORIES[category].0);
-        }
-        Ok(())
-    }
-
     fn trash_selected(&mut self) -> io::Result<()> {
         if let Some(path) = self.selected_path() {
             if self.is_secret_path(&path) {
                 self.message = "Encrypted trash is not available yet".into();
                 return Ok(());
             }
-            let folder = self.category_directory(TRASH_CATEGORY_INDEX);
+            let folder = self.directory.join(".quietwrite/Trash");
             fs::create_dir_all(&folder)?;
             let destination = unique_destination(&folder, path.file_name().unwrap_or_default());
             fs::rename(&path, destination)?;
@@ -1466,11 +1305,9 @@ impl App {
             framebuffer.clear(palette.background, self.rotation);
             let heading = match prompt {
                 TextPrompt::Rename => "Rename document",
-                TextPrompt::SearchShelf => "Search this shelf",
+                TextPrompt::SearchSpace => "Search this space",
                 TextPrompt::FindDraft => "Find in draft",
                 TextPrompt::WordTarget => "Session word target",
-                TextPrompt::NewProject => "New project",
-                TextPrompt::NewChapter => "New chapter",
             };
             framebuffer.text(
                 layout.margin_x,
@@ -1515,7 +1352,7 @@ impl App {
                 self.rotation,
             );
             let title = if self.screen == Screen::Categories {
-                "Choose a shelf"
+                "Choose a space"
             } else {
                 CATEGORIES[self.category_index].0
             };
@@ -1946,42 +1783,17 @@ impl App {
                 Key::Enter if self.screen == Screen::Documents => self.open_selected_document()?,
                 Key::New if self.screen == Screen::Documents => self.new_note()?,
                 Key::Search if self.screen == Screen::Documents => {
-                    self.start_prompt(TextPrompt::SearchShelf)
+                    self.start_prompt(TextPrompt::SearchSpace)
                 }
                 Key::Char('/') if self.screen == Screen::Documents => {
-                    self.start_prompt(TextPrompt::SearchShelf)
+                    self.start_prompt(TextPrompt::SearchSpace)
                 }
                 Key::Char('r') if self.screen == Screen::Documents => {
                     self.start_prompt(TextPrompt::Rename)
                 }
                 Key::Char('p') if self.screen == Screen::Documents => self.toggle_pin()?,
                 Key::Char('d') if self.screen == Screen::Documents => self.trash_selected()?,
-                Key::Char('a') if self.screen == Screen::Documents => {
-                    self.move_selected_to(ARCHIVE_CATEGORY_INDEX)?
-                }
                 Key::Char('v') if self.screen == Screen::Documents => self.select_reference()?,
-                Key::Char('j')
-                    if self.screen == Screen::Documents
-                        && self.category_index == PROJECTS_CATEGORY_INDEX =>
-                {
-                    self.start_prompt(TextPrompt::NewProject)
-                }
-                Key::Char('c')
-                    if self.screen == Screen::Documents
-                        && self.category_index == PROJECTS_CATEGORY_INDEX =>
-                {
-                    self.start_prompt(TextPrompt::NewChapter)
-                }
-                Key::Char('e')
-                    if self.screen == Screen::Documents
-                        && self.category_index == PROJECTS_CATEGORY_INDEX =>
-                {
-                    self.export_selected_book()?
-                }
-                Key::Char('m') if self.screen == Screen::Documents => {
-                    let destination = (self.category_index + 1) % CATEGORIES.len();
-                    self.move_selected_to(destination)?;
-                }
                 Key::Browser | Key::Escape if self.screen == Screen::Documents => {
                     if self.category_index == SECRET_CATEGORY_INDEX {
                         self.lock_secrets();
@@ -2190,14 +2002,6 @@ fn safe_filename(input: &str) -> String {
         .to_string()
 }
 
-fn html_escape(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 fn history_key(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -2274,15 +2078,15 @@ fn latest_note(directory: &Path) -> Option<PathBuf> {
 
 fn notes_for_category(directory: &Path, category_index: usize) -> Vec<PathBuf> {
     let mut notes = Vec::new();
-    if category_index == 0 {
-        // Root-level Markdown files are legacy notes. Keep them in place and list them with Notes.
-        collect_markdown(directory, false, &mut notes);
+    if category_index == SECRET_CATEGORY_INDEX {
+        collect_markdown(&directory.join("Secret Thoughts"), true, &mut notes);
+    } else {
+        // Writing is a virtual shelf over every former ordinary folder. Existing files stay put.
+        collect_root_markdown(directory, &mut notes);
+        for folder in ORDINARY_FOLDERS {
+            collect_markdown(&directory.join(folder), true, &mut notes);
+        }
     }
-    collect_markdown(
-        &directory.join(CATEGORIES[category_index.min(CATEGORIES.len() - 1)].1),
-        category_index == PROJECTS_CATEGORY_INDEX,
-        &mut notes,
-    );
     notes.sort_by_key(|path| {
         std::cmp::Reverse(
             fs::metadata(path)
@@ -2291,6 +2095,21 @@ fn notes_for_category(directory: &Path, category_index: usize) -> Vec<PathBuf> {
         )
     });
     notes
+}
+
+fn collect_root_markdown(directory: &Path, notes: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    notes.extend(
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path.extension().and_then(|extension| extension.to_str()) == Some("md")
+            }),
+    );
 }
 
 fn collect_markdown(folder: &Path, recursive: bool, notes: &mut Vec<PathBuf>) {
@@ -2792,7 +2611,7 @@ fn draw_tui(frame: &mut Frame, app: &mut App) {
             Line::from("F4       Start / stop 25m sprint"),
             Line::from("Ctrl+G   Set word target"),
             Line::from("Ctrl+Q   Save and quit"),
-            Line::from("F2       Browse shelves"),
+            Line::from("F2       Browse spaces"),
             Line::from("F5       Change theme"),
             Line::from("F9       Toggle outline"),
             Line::from("F10      Toggle reference split"),
@@ -2817,11 +2636,9 @@ fn draw_text_prompt(frame: &mut Frame, app: &App, area: Rect, palette: ThemePale
     };
     let title = match prompt {
         TextPrompt::Rename => " Rename document ",
-        TextPrompt::SearchShelf => " Search this shelf ",
+        TextPrompt::SearchSpace => " Search this space ",
         TextPrompt::FindDraft => " Find in draft ",
         TextPrompt::WordTarget => " Session word target ",
-        TextPrompt::NewProject => " New project ",
-        TextPrompt::NewChapter => " New chapter ",
     };
     let popup = centered_rect(64, 22, area);
     frame.render_widget(Clear, popup);
@@ -2869,7 +2686,7 @@ fn draw_tui_browser(frame: &mut Frame, app: &mut App, area: Rect, palette: Theme
         ])
         .split(area);
     let title = if app.screen == Screen::Categories {
-        "Choose a shelf"
+        "Choose a space"
     } else {
         CATEGORIES[app.category_index].0
     };
@@ -2901,18 +2718,11 @@ fn draw_tui_browser(frame: &mut Frame, app: &mut App, area: Rect, palette: Theme
         app.documents
             .iter()
             .map(|path| {
-                let name = if app.category_index == PROJECTS_CATEGORY_INDEX {
-                    path.strip_prefix(app.category_directory(PROJECTS_CATEGORY_INDEX))
-                        .unwrap_or(path)
-                        .with_extension("")
-                        .display()
-                        .to_string()
-                } else {
-                    path.file_stem()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("Untitled")
-                        .to_string()
-                };
+                let name = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Untitled")
+                    .to_string();
                 let pin = if app.pinned.contains(path) {
                     "★ "
                 } else {
@@ -2945,16 +2755,12 @@ fn draw_tui_browser(frame: &mut Frame, app: &mut App, area: Rect, palette: Theme
     frame.render_stateful_widget(list, chunks[1], &mut state);
     let footer = if app.screen == Screen::Categories {
         if app.category_index == SECRET_CATEGORY_INDEX {
-            " ↑↓ choose · Enter unlock · F5 theme · F7/F8 size on Pi · app lock only "
+            " ↑↓ choose · Enter unlock · F5 theme · F7/F8 size on Pi · encrypted "
         } else {
             " ↑↓ choose · Enter open · F5 theme · F7/F8 size on Pi · Ctrl+Q quit "
         }
     } else {
-        if app.category_index == PROJECTS_CATEGORY_INDEX {
-            " ↑↓ open · j book · c chapter · e export · v reference · / search · p pin "
-        } else {
-            " ↑↓ open · v reference · / search · p pin · r rename · m move · a archive · d trash "
-        }
+        " ↑↓ open · v reference · / search · p pin · r rename · d trash · F2 back "
     };
     draw_info_bar(frame, app, footer, chunks[2], palette);
     if let Some(prompt) = app.lock_prompt {
@@ -3456,107 +3262,125 @@ mod tests {
     }
 
     #[test]
-    fn browser_can_search_pin_archive_and_trash() {
+    fn browser_can_search_pin_and_safely_trash() {
         let directory = test_directory("manage");
         let drafts = directory.join("Drafts");
         atomic_write(&drafts.join("chapter.md"), b"a lighthouse scene").unwrap();
         atomic_write(&drafts.join("other.md"), b"market scene").unwrap();
         let mut app = App::open(directory.clone(), None, false).unwrap();
-        app.category_index = 1;
+        app.category_index = 0;
         app.open_category();
-        app.shelf_search = "lighthouse".into();
+        app.space_search = "lighthouse".into();
         app.refresh_documents();
         assert_eq!(app.documents.len(), 1);
         app.toggle_pin().unwrap();
         assert_eq!(app.pinned.len(), 1);
-        app.move_selected_to(ARCHIVE_CATEGORY_INDEX).unwrap();
-        assert!(directory.join("Archive/chapter.md").exists());
-        assert_eq!(
-            fs::read_to_string(directory.join("Archive/chapter.md")).unwrap(),
-            "a lighthouse scene"
-        );
-        assert_eq!(app.category_index, ARCHIVE_CATEGORY_INDEX);
-        assert_eq!(
-            app.selected_path(),
-            Some(directory.join("Archive/chapter.md"))
-        );
-        app.category_index = 1;
-        app.shelf_search.clear();
+        app.space_search.clear();
         app.refresh_documents();
+        app.document_index = app
+            .documents
+            .iter()
+            .position(|path| path.ends_with("other.md"))
+            .unwrap();
         app.trash_selected().unwrap();
         assert!(directory.join(".quietwrite/Trash/other.md").exists());
+        assert!(!notes_for_category(&directory, 0)
+            .iter()
+            .any(|path| path.ends_with("other.md")));
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn projects_discover_nested_chapters_and_open_references() {
-        let directory = test_directory("projects");
-        let project = directory.join("Projects/Glass House");
-        atomic_write(&project.join("01-arrival.md"), b"# Arrival\nDraft").unwrap();
-        atomic_write(&project.join("02-letter.md"), b"# Letter\nReference").unwrap();
-        let chapters = notes_for_category(&directory, PROJECTS_CATEGORY_INDEX);
-        assert_eq!(chapters.len(), 2);
+    fn menu_has_only_writing_and_secret_thoughts() {
+        assert_eq!(
+            CATEGORIES,
+            &[("Writing", "Notes"), ("Secret Thoughts", "Secret Thoughts")]
+        );
+        assert_eq!(SECRET_CATEGORY_INDEX, 1);
+    }
+
+    #[test]
+    fn writing_aggregates_former_shelves_and_excludes_internal_folders() {
+        let directory = test_directory("aggregate");
+        let expected = [
+            "legacy.md",
+            "Notes/note.md",
+            "Drafts/draft.md",
+            "Journal/day.md",
+            "Poems/verse.md",
+            "Ideas/spark.md",
+            "Projects/Novel/chapter.md",
+        ];
+        for relative in expected {
+            atomic_write(&directory.join(relative), relative.as_bytes()).unwrap();
+        }
+        atomic_write(&directory.join("Secret Thoughts/private.md"), b"secret").unwrap();
+        atomic_write(&directory.join("Archive/old.md"), b"old").unwrap();
+        atomic_write(&directory.join(".quietwrite/Trash/deleted.md"), b"deleted").unwrap();
+        atomic_write(&directory.join("Exports/output.md"), b"export").unwrap();
+        atomic_write(
+            &directory.join(".quietwrite/history/version.md"),
+            b"version",
+        )
+        .unwrap();
+
+        let before: Vec<_> = expected
+            .iter()
+            .map(|path| {
+                (
+                    directory.join(path),
+                    fs::read(directory.join(path)).unwrap(),
+                )
+            })
+            .collect();
+        let writing = notes_for_category(&directory, 0);
+        for relative in expected {
+            assert!(
+                writing.contains(&directory.join(relative)),
+                "missing {relative}"
+            );
+        }
+        assert_eq!(writing.len(), expected.len());
+        for (path, contents) in before {
+            assert_eq!(fs::read(path).unwrap(), contents);
+        }
+        assert!(!writing.contains(&directory.join("Exports/output.md")));
+        assert_eq!(
+            fs::read_to_string(directory.join("Exports/output.md")).unwrap(),
+            "export"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn writing_documents_can_still_open_as_references() {
+        let directory = test_directory("references");
+        atomic_write(
+            &directory.join("Projects/Glass House/letter.md"),
+            b"# Letter
+Reference",
+        )
+        .unwrap();
         let mut app = App::open(directory.clone(), None, false).unwrap();
-        app.category_index = PROJECTS_CATEGORY_INDEX;
+        app.category_index = 0;
         app.open_category();
         app.document_index = app
             .documents
             .iter()
-            .position(|path| path.ends_with("02-letter.md"))
+            .position(|path| path.ends_with("letter.md"))
             .unwrap();
         app.select_reference().unwrap();
         assert!(app.split_visible);
         assert_eq!(
             app.reference_text.iter().collect::<String>(),
-            "# Letter\nReference"
+            "# Letter
+Reference"
         );
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn project_prompt_creates_a_plain_folder_and_chapter() {
-        let directory = test_directory("new-project");
-        let mut app = App::open(directory.clone(), None, false).unwrap();
-        app.text_prompt = Some(TextPrompt::NewProject);
-        app.prompt_input = "Night Train".into();
-        app.submit_text_prompt().unwrap();
-        let chapter = directory.join("Projects/Night Train/10-chapter-1.md");
-        assert!(chapter.exists());
-        assert_eq!(app.path, chapter);
-        assert!(directory
-            .join("Projects/Night Train/00-title-page.md")
-            .exists());
-        assert!(directory
-            .join("Projects/Night Train/01-copyright.md")
-            .exists());
-        assert!(directory
-            .join("Projects/Night Train/90-about-the-author.md")
-            .exists());
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn book_export_combines_chapters_in_filename_order() {
-        let directory = test_directory("book-export");
-        let project = directory.join("Projects/Night Train");
-        atomic_write(&project.join("20-ending.md"), b"# Ending\n\nLast line.").unwrap();
-        atomic_write(&project.join("10-opening.md"), b"# Opening\n\nFirst line.").unwrap();
-        let mut app = App::open(directory.clone(), None, false).unwrap();
-        app.category_index = PROJECTS_CATEGORY_INDEX;
-        app.open_category();
-        app.export_selected_book().unwrap();
-        let export = directory.join("Exports/Night Train");
-        let markdown = fs::read_to_string(export.join("manuscript.md")).unwrap();
-        assert!(markdown.find("First line.").unwrap() < markdown.find("Last line.").unwrap());
-        let html = fs::read_to_string(export.join("manuscript.html")).unwrap();
-        assert!(html.contains("<h1>Opening</h1>"));
-        assert!(html.contains("<title>Night Train</title>"));
-        assert!(export.join("KDP-README.txt").exists());
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn notes_shelf_includes_legacy_root_files_without_moving_them() {
+    fn writing_space_includes_legacy_root_files_without_moving_them() {
         let directory = test_directory("legacy");
         fs::create_dir_all(directory.join("Notes")).unwrap();
         fs::create_dir_all(directory.join("Poems")).unwrap();
@@ -3566,7 +3390,7 @@ mod tests {
         let notes = notes_for_category(&directory, 0);
         assert!(notes.contains(&directory.join("legacy.md")));
         assert!(notes.contains(&directory.join("Notes/new.md")));
-        assert!(!notes.contains(&directory.join("Poems/verse.md")));
+        assert!(notes.contains(&directory.join("Poems/verse.md")));
         assert_eq!(
             fs::read_to_string(directory.join("legacy.md")).unwrap(),
             "still here"
@@ -3592,7 +3416,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_moves_between_shelves_documents_and_editor() {
+    fn browser_moves_between_spaces_documents_and_editor() {
         let directory = test_directory("browser");
         let mut app = App::open(directory.clone(), None, false).unwrap();
         assert_eq!(app.screen, Screen::Categories);
@@ -3671,7 +3495,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_shelf_prompts_and_locks_again_when_leaving() {
+    fn secret_space_prompts_and_locks_again_when_leaving() {
         let directory = test_directory("secret-flow");
         let mut app = App::open(directory.clone(), None, false).unwrap();
         app.secret_lock_path = directory.join("secret.lock");

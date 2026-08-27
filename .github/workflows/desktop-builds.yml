@@ -33,11 +33,11 @@ jobs:
         run: |
           mkdir -p package
           cp target/${{ matrix.target }}/release/quietwrite README.md LICENSE package/
-          tar -C package -czf quietwrite-0.4.2-macos-${{ matrix.arch }}.tar.gz .
+          tar -C package -czf quietwrite-macos-${{ matrix.arch }}.tar.gz .
       - uses: actions/upload-artifact@v4
         with:
-          name: quietwrite-0.4.2-macos-${{ matrix.arch }}
-          path: quietwrite-0.4.2-macos-${{ matrix.arch }}.tar.gz
+          name: quietwrite-macos-${{ matrix.arch }}
+          path: quietwrite-macos-${{ matrix.arch }}.tar.gz
 
   windows:
     name: Windows x64
@@ -54,8 +54,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force package | Out-Null
           Copy-Item target/x86_64-pc-windows-msvc/release/quietwrite.exe,README.md,LICENSE package/
-          Compress-Archive -Path package/* -DestinationPath quietwrite-0.4.2-windows-x64.zip
+          Compress-Archive -Path package/* -DestinationPath quietwrite-windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: quietwrite-0.4.2-windows-x64
-          path: quietwrite-0.4.2-windows-x64.zip
+          name: quietwrite-windows-x64
+          path: quietwrite-windows-x64.zip

@@ -11,5 +11,5 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 cargo build --release --target $Target
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 New-Item -ItemType Directory -Force dist | Out-Null
-Copy-Item "$env:CARGO_TARGET_DIR/$Target/release/quietwrite.exe" "dist/quietwrite-0.8.0-windows-x64.exe"
-Write-Host "Built dist/quietwrite-0.8.0-windows-x64.exe"
+Copy-Item "$env:CARGO_TARGET_DIR/$Target/release/quietwrite.exe" "dist/quietwrite-windows-x64.exe"
+Write-Host "Built dist/quietwrite-windows-x64.exe"
