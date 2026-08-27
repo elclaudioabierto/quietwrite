@@ -1,0 +1,8 @@
+/target/
+/.tools/
+/dist/
+/tmp/
+/quietwrite
+*.exe
+*.tar.gz
+.DS_Store

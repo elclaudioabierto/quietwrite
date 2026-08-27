@@ -1,0 +1,61 @@
+name: Desktop builds
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: apple-silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - arch: intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p package
+          cp target/${{ matrix.target }}/release/quietwrite README.md LICENSE package/
+          tar -C package -czf quietwrite-0.4.2-macos-${{ matrix.arch }}.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quietwrite-0.4.2-macos-${{ matrix.arch }}
+          path: quietwrite-0.4.2-macos-${{ matrix.arch }}.tar.gz
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: cargo test
+      - run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/quietwrite.exe,README.md,LICENSE package/
+          Compress-Archive -Path package/* -DestinationPath quietwrite-0.4.2-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quietwrite-0.4.2-windows-x64
+          path: quietwrite-0.4.2-windows-x64.zip
