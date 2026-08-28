@@ -7,7 +7,18 @@ QuietWrite is one native binary with two visible spaces:
 - **Writing** — ordinary local Markdown
 - **Secret Thoughts** — password-protected local encryption
 
-No account, cloud service, telemetry, NLP, or publishing platform is required.
+No account, cloud service, telemetry, NLP, or publishing platform is required. Your writing stays in files you control.
+
+## Project roadmap
+
+QuietWrite is meant to run on useful hardware people already have, rather than require one official device. I intend to publish:
+
+- 3D-printable case files for several QuietWrite builds
+- multiple bills of materials (BOMs), covering different displays, keyboards, power options, and readily available computers
+- prebuilt binaries and ready-to-use images for as many operating systems as practical
+- support for older 32-bit systems where the operating system, Rust toolchain, and hardware make it possible
+
+These resources will be added progressively. Each release will state which platforms and hardware combinations have been built and tested; planned targets should not be treated as supported until they appear in a release.
 
 ## Writing
 
@@ -118,7 +129,7 @@ Windows PowerShell with the Rust MSVC toolchain:
 .\scripts\build-desktop.ps1
 ```
 
-The manually triggered **Desktop builds** GitHub Actions workflow creates downloadable archives.
+The manually triggered **Desktop builds** GitHub Actions workflow creates downloadable archives. Broader release coverage—including additional Linux targets and older 32-bit systems where feasible—is planned; see [Project roadmap](#project-roadmap).
 
 Settings locations:
 
@@ -146,3 +157,7 @@ The Pi Zero W release is a static `arm-unknown-linux-musleabihf` binary compiled
 ## Design boundary
 
 QuietWrite 0.9 is a minimal private writing desk, not a manuscript publisher or content-management system. Ordinary writing remains readable Markdown; only Secret Thoughts is encrypted.
+
+## License
+
+QuietWrite is released under the [MIT License](LICENSE).
