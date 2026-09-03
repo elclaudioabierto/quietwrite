@@ -4,21 +4,21 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use chrono::Local;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-#[cfg(target_os = "linux")]
-use std::io::Read;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+    Arc, Mutex,
 };
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::{
@@ -39,11 +39,14 @@ use zeroize::Zeroize;
 
 #[cfg(target_os = "linux")]
 mod framebuffer;
+mod web_share;
 #[cfg(target_os = "linux")]
 use framebuffer::Framebuffer;
+use web_share::WebShare;
 
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
 const NETWORK_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const GIT_BACKUP_INTERVAL: Duration = Duration::from_secs(300);
 #[cfg(not(test))]
 const NETWORK_TIMEOUT: Duration = Duration::from_millis(700);
 #[cfg(target_os = "linux")]
@@ -231,6 +234,9 @@ enum Key {
     PreviousHeading,
     NextHeading,
     SplitView,
+    GitBackup,
+    Bluetooth,
+    WifiShare,
     Unknown,
 }
 
@@ -250,6 +256,7 @@ fn decode_key(bytes: &mut Vec<u8>) -> Option<Key> {
         18 => Some(Key::Restore),
         6 => Some(Key::Search),
         7 => Some(Key::Target),
+        5 => Some(Key::WifiShare),
         13 | 10 => Some(Key::Enter),
         8 | 127 => Some(Key::Backspace),
         _ => None,
@@ -291,6 +298,8 @@ fn decode_key(bytes: &mut Vec<u8>) -> Option<Key> {
             (b"\x1b[19~", Key::Smaller),
             (b"\x1b[20~", Key::Outline),
             (b"\x1b[21~", Key::SplitView),
+            (b"\x1b[23~", Key::GitBackup),
+            (b"\x1b[24~", Key::Bluetooth),
         ];
         for (sequence, key) in SEQUENCES {
             if bytes.starts_with(sequence) {
@@ -315,6 +324,8 @@ fn decode_key(bytes: &mut Vec<u8>) -> Option<Key> {
                     Key::Smaller => Key::Smaller,
                     Key::Outline => Key::Outline,
                     Key::SplitView => Key::SplitView,
+                    Key::GitBackup => Key::GitBackup,
+                    Key::Bluetooth => Key::Bluetooth,
                     Key::PreviousHeading => Key::PreviousHeading,
                     Key::NextHeading => Key::NextHeading,
                     _ => Key::Unknown,
@@ -567,6 +578,42 @@ enum Screen {
     Editor,
     Categories,
     Documents,
+    Bluetooth,
+    WifiShare,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BluetoothPhase {
+    Idle,
+    Scanning,
+    Pairing,
+    Ready,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BluetoothDevice {
+    address: String,
+    name: String,
+    paired: bool,
+    connected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BluetoothPanel {
+    phase: BluetoothPhase,
+    devices: Vec<BluetoothDevice>,
+    message: String,
+}
+
+impl Default for BluetoothPanel {
+    fn default() -> Self {
+        Self {
+            phase: BluetoothPhase::Idle,
+            devices: Vec::new(),
+            message: "Press r to search for keyboards".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,6 +621,9 @@ enum LockPrompt {
     Create,
     Confirm,
     Unlock,
+    ResetWarning,
+    ResetCreate,
+    ResetConfirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -623,6 +673,19 @@ struct App {
     reference_text: Vec<char>,
     network_status: Arc<AtomicU8>,
     last_network_check: Instant,
+    git_backup_enabled: bool,
+    git_backup_config: PathBuf,
+    last_git_backup: Instant,
+    bluetooth: Arc<Mutex<BluetoothPanel>>,
+    bluetooth_index: usize,
+    bluetooth_return_screen: Screen,
+    bluetooth_pair_process: Arc<Mutex<Option<Child>>>,
+    bluetooth_pair_cancelled: Arc<AtomicBool>,
+    bluetooth_scan_process: Arc<Mutex<Option<Child>>>,
+    bluetooth_scan_cancelled: Arc<AtomicBool>,
+    bluetooth_scan_generation: Arc<AtomicU64>,
+    web_share: WebShare,
+    web_share_return_screen: Screen,
 }
 
 impl App {
@@ -645,6 +708,9 @@ impl App {
         };
         let display_config = default_config_path();
         let secret_lock_path = default_secret_lock_path();
+        let git_backup_config = default_git_backup_config_path();
+        let git_backup_enabled = read_git_backup_config(&git_backup_config);
+        restore_secret_lock_backup(&directory, &secret_lock_path)?;
         let (rotation, zoom, theme) = read_display_config(&display_config);
         let state_path = directory.join(".quietwrite/state");
         let screen = if explicit_open || force_new {
@@ -699,6 +765,19 @@ impl App {
             reference_text: Vec::new(),
             network_status,
             last_network_check: Instant::now(),
+            git_backup_enabled,
+            git_backup_config,
+            last_git_backup: Instant::now(),
+            bluetooth: Arc::new(Mutex::new(BluetoothPanel::default())),
+            bluetooth_index: 0,
+            bluetooth_return_screen: Screen::Categories,
+            bluetooth_pair_process: Arc::new(Mutex::new(None)),
+            bluetooth_pair_cancelled: Arc::new(AtomicBool::new(false)),
+            bluetooth_scan_process: Arc::new(Mutex::new(None)),
+            bluetooth_scan_cancelled: Arc::new(AtomicBool::new(false)),
+            bluetooth_scan_generation: Arc::new(AtomicU64::new(0)),
+            web_share: WebShare::new(),
+            web_share_return_screen: Screen::Categories,
         })
     }
 
@@ -760,7 +839,199 @@ impl App {
             1 => "○ offline",
             _ => "… checking",
         };
-        format!("{}  ·  {connection}", Local::now().format("%H:%M"))
+        let backup = if self.git_backup_enabled {
+            "  ·  Git backup on"
+        } else {
+            ""
+        };
+        let sharing = if self.web_share.snapshot().running {
+            "  ·  Wi-Fi share on"
+        } else {
+            ""
+        };
+        format!(
+            "{}  ·  v{}  ·  {connection}{backup}{sharing}",
+            Local::now().format("%H:%M"),
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+
+    fn run_git_backup(&mut self) {
+        self.last_git_backup = Instant::now();
+        self.message = match git_backup(&self.directory, &self.secret_lock_path) {
+            Ok(GitBackupResult::Pushed) => "Git backup pushed".into(),
+            Ok(GitBackupResult::LocalOnly { changed: true }) => {
+                "Git snapshot saved locally; add origin for device-loss protection".into()
+            }
+            Ok(GitBackupResult::LocalOnly { changed: false }) => {
+                "Git backup is local-only; add origin for device-loss protection".into()
+            }
+            Ok(GitBackupResult::NoChanges) => "Git backup is current".into(),
+            Err(error) => format!("Git backup failed: {error}"),
+        };
+    }
+
+    fn maybe_git_backup(&mut self) -> bool {
+        if self.git_backup_enabled && self.last_git_backup.elapsed() >= GIT_BACKUP_INTERVAL {
+            self.run_git_backup();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn toggle_git_backup(&mut self) -> io::Result<()> {
+        if self.git_backup_enabled {
+            self.git_backup_enabled = false;
+            write_git_backup_config(&self.git_backup_config, false)?;
+            self.message = "Git backup off".into();
+            return Ok(());
+        }
+        if !git_available() {
+            self.message = "Git backup unavailable: install git first".into();
+            return Ok(());
+        }
+        self.save()?;
+        self.git_backup_enabled = true;
+        write_git_backup_config(&self.git_backup_config, true)?;
+        self.run_git_backup();
+        Ok(())
+    }
+
+    fn open_bluetooth(&mut self) {
+        if self.screen != Screen::Bluetooth {
+            self.bluetooth_return_screen = self.screen;
+        }
+        self.screen = Screen::Bluetooth;
+        self.bluetooth_index = 0;
+        self.start_bluetooth_scan();
+    }
+
+    fn close_bluetooth(&mut self) {
+        self.cancel_bluetooth_scan();
+        self.cancel_bluetooth_pairing();
+        self.screen = self.bluetooth_return_screen;
+    }
+
+    fn cancel_bluetooth_scan(&mut self) {
+        self.bluetooth_scan_cancelled.store(true, Ordering::Relaxed);
+        self.bluetooth_scan_generation
+            .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut process) = self.bluetooth_scan_process.lock() {
+            if let Some(child) = process.as_mut() {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    fn cancel_bluetooth_pairing(&mut self) {
+        let pairing = self
+            .bluetooth
+            .lock()
+            .is_ok_and(|panel| panel.phase == BluetoothPhase::Pairing);
+        if !pairing {
+            return;
+        }
+        self.bluetooth_pair_cancelled.store(true, Ordering::Relaxed);
+        if let Ok(mut process) = self.bluetooth_pair_process.lock() {
+            if let Some(child) = process.as_mut() {
+                let _ = child.kill();
+            }
+        }
+        if let Ok(mut panel) = self.bluetooth.lock() {
+            panel.phase = BluetoothPhase::Ready;
+            panel.message = "Pairing cancelled".into();
+        }
+    }
+
+    fn start_bluetooth_scan(&mut self) {
+        self.cancel_bluetooth_scan();
+        let Ok(mut panel) = self.bluetooth.lock() else {
+            self.message = "Bluetooth state unavailable".into();
+            return;
+        };
+        if panel.phase == BluetoothPhase::Pairing {
+            return;
+        }
+        panel.phase = BluetoothPhase::Scanning;
+        panel.devices.clear();
+        panel.message = "Searching for Bluetooth keyboards…".into();
+        drop(panel);
+        self.bluetooth_scan_cancelled
+            .store(false, Ordering::Relaxed);
+        let generation = self
+            .bluetooth_scan_generation
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let state = Arc::clone(&self.bluetooth);
+        let process = Arc::clone(&self.bluetooth_scan_process);
+        let cancelled = Arc::clone(&self.bluetooth_scan_cancelled);
+        let active_generation = Arc::clone(&self.bluetooth_scan_generation);
+        thread::spawn(move || {
+            stream_bluetooth_keyboards(state, process, cancelled, active_generation, generation)
+        });
+    }
+
+    fn pair_selected_bluetooth(&mut self) {
+        let (device, busy) = match self.bluetooth.lock() {
+            Ok(panel) => (
+                panel.devices.get(self.bluetooth_index).cloned(),
+                panel.phase == BluetoothPhase::Pairing,
+            ),
+            Err(_) => (None, true),
+        };
+        if busy {
+            return;
+        }
+        let Some(device) = device else {
+            return;
+        };
+        self.cancel_bluetooth_scan();
+        if let Ok(mut panel) = self.bluetooth.lock() {
+            panel.phase = BluetoothPhase::Pairing;
+            panel.message = format!("Pairing with {}… Press F12 or Esc to cancel", device.name);
+        }
+        self.bluetooth_pair_cancelled
+            .store(false, Ordering::Relaxed);
+        let state = Arc::clone(&self.bluetooth);
+        let process = Arc::clone(&self.bluetooth_pair_process);
+        let cancelled = Arc::clone(&self.bluetooth_pair_cancelled);
+        thread::spawn(move || pair_bluetooth_keyboard(device, state, process, cancelled));
+    }
+
+    fn bluetooth_snapshot(&self) -> BluetoothPanel {
+        self.bluetooth
+            .lock()
+            .map(|panel| panel.clone())
+            .unwrap_or_else(|_| BluetoothPanel {
+                phase: BluetoothPhase::Error,
+                devices: Vec::new(),
+                message: "Bluetooth state unavailable".into(),
+            })
+    }
+
+    fn open_wifi_share(&mut self) {
+        if self.screen != Screen::WifiShare {
+            self.web_share_return_screen = self.screen;
+        }
+        self.screen = Screen::WifiShare;
+        let share = self.web_share.snapshot();
+        if !share.running && !share.starting {
+            self.web_share.start(self.directory.clone());
+        }
+    }
+
+    fn close_wifi_share(&mut self) {
+        self.screen = self.web_share_return_screen;
+    }
+
+    fn toggle_wifi_share(&mut self) {
+        let share = self.web_share.snapshot();
+        if share.running || share.starting {
+            self.web_share.stop();
+        } else {
+            self.web_share.start(self.directory.clone());
+        }
     }
 
     fn snapshot_current(&self) -> io::Result<()> {
@@ -926,6 +1197,13 @@ impl App {
         };
     }
 
+    fn begin_secret_reset(&mut self) {
+        self.password_input.clear();
+        self.password_confirmation.clear();
+        self.lock_prompt = Some(LockPrompt::ResetWarning);
+        self.message = "Type RESET to archive the locked vault and start fresh".into();
+    }
+
     fn lock_secrets(&mut self) {
         self.secret_unlocked = false;
         if let Some(mut key) = self.secret_key.take() {
@@ -1004,6 +1282,62 @@ impl App {
                     Err(error) => self.message = format!("Could not read lock: {error}"),
                 }
             }
+            Some(LockPrompt::ResetWarning) => {
+                if self.password_input != "RESET" {
+                    self.password_input.clear();
+                    self.message = "Type RESET exactly, or Esc to keep the vault unchanged".into();
+                    return;
+                }
+                self.password_input.clear();
+                match archive_secret_vault(
+                    &self.directory,
+                    &self.secret_lock_path,
+                    SystemTime::now(),
+                ) {
+                    Ok(path) => {
+                        self.lock_prompt = Some(LockPrompt::ResetCreate);
+                        self.message = format!(
+                            "Old encrypted vault archived at {}. Create a new password",
+                            path.display()
+                        );
+                    }
+                    Err(error) => {
+                        self.lock_prompt = Some(LockPrompt::Unlock);
+                        self.message = format!("Reset stopped; old vault left active: {error}");
+                    }
+                }
+            }
+            Some(LockPrompt::ResetCreate) => {
+                if self.password_input.len() < 8 {
+                    self.message = "Use at least 8 characters".into();
+                    return;
+                }
+                self.password_confirmation = std::mem::take(&mut self.password_input);
+                self.lock_prompt = Some(LockPrompt::ResetConfirm);
+                self.message = "Enter the new password again".into();
+            }
+            Some(LockPrompt::ResetConfirm) => {
+                if self.password_input != self.password_confirmation {
+                    self.password_input.clear();
+                    self.password_confirmation.clear();
+                    self.lock_prompt = Some(LockPrompt::ResetCreate);
+                    self.message = "Passwords did not match — try again".into();
+                    return;
+                }
+                match create_secret_lock(&self.secret_lock_path, self.password_input.as_bytes()) {
+                    Ok(recovery_key) => {
+                        self.secret_unlocked = true;
+                        self.secret_key.replace(recovery_key);
+                        self.lock_prompt = None;
+                        self.password_input.clear();
+                        self.password_confirmation.clear();
+                        self.open_category();
+                        self.message =
+                            "Fresh Secret Thoughts vault ready; recovery archive kept".into();
+                    }
+                    Err(error) => self.message = format!("Could not save new lock: {error}"),
+                }
+            }
             None => {}
         }
     }
@@ -1036,6 +1370,14 @@ impl App {
         self.text_prompt = Some(prompt);
     }
 
+    fn start_rename_prompt(&mut self) {
+        self.prompt_input = self
+            .selected_path()
+            .and_then(|path| path.file_stem()?.to_str().map(str::to_owned))
+            .unwrap_or_default();
+        self.text_prompt = Some(TextPrompt::Rename);
+    }
+
     fn submit_text_prompt(&mut self) -> io::Result<()> {
         let Some(prompt) = self.text_prompt.take() else {
             return Ok(());
@@ -1045,15 +1387,28 @@ impl App {
             TextPrompt::Rename => {
                 if let Some(path) = self.selected_path() {
                     let name = safe_filename(&input);
-                    if !name.is_empty() {
-                        let destination = path.with_file_name(format!("{name}.md"));
-                        fs::rename(&path, &destination)?;
-                        if self.pinned.remove(&path) {
-                            self.pinned.insert(destination);
-                        }
-                        self.save_pins()?;
-                        self.refresh_documents();
-                        self.message = "renamed".into();
+                    if name.is_empty() {
+                        self.message = "name cannot be empty".into();
+                        return Ok(());
+                    }
+                    let destination = path.with_file_name(format!("{name}.md"));
+                    if destination == path {
+                        self.message = "name unchanged".into();
+                        return Ok(());
+                    }
+                    if destination.exists() {
+                        self.message = "a note with that name already exists".into();
+                        return Ok(());
+                    }
+                    fs::rename(&path, &destination)?;
+                    if self.pinned.remove(&path) {
+                        self.pinned.insert(destination);
+                    }
+                    self.save_pins()?;
+                    self.refresh_documents();
+                    self.message = "renamed".into();
+                    if self.git_backup_enabled {
+                        self.run_git_backup();
                     }
                 }
             }
@@ -1280,7 +1635,7 @@ impl App {
             frame.push_str(&" ".repeat(columns - used));
         }
         frame.push_str("\x1b[0m\r\n\x1b[2K");
-        let help = " F1 Help  ·  F5 Theme  ·  F6 Rotate ";
+        let help = " F1 Help · F11 Backup · F12 Bluetooth · Ctrl+E Wi-Fi ";
         frame.push_str(&truncate(help, columns));
 
         let screen_cursor_row = cursor_row
@@ -1339,6 +1694,155 @@ impl App {
             framebuffer.flush();
             return Ok(());
         }
+        if self.screen == Screen::WifiShare {
+            let layout = framebuffer.layout(self.rotation, -3);
+            let share = self.web_share.snapshot();
+            framebuffer.clear(palette.background, self.rotation);
+            framebuffer.text(
+                layout.margin_x,
+                layout.margin_y,
+                "Wi-Fi note library",
+                layout,
+                palette.accent,
+                palette.background,
+                self.rotation,
+            );
+            framebuffer.text(
+                layout.margin_x,
+                layout.margin_y + layout.line_height * 3,
+                &share.message,
+                layout,
+                palette.muted,
+                palette.background,
+                self.rotation,
+            );
+            if share.running || share.starting {
+                framebuffer.text(
+                    layout.margin_x,
+                    layout.margin_y + layout.line_height * 6,
+                    &share.url,
+                    layout,
+                    palette.foreground,
+                    palette.background,
+                    self.rotation,
+                );
+                framebuffer.text(
+                    layout.margin_x,
+                    layout.margin_y + layout.line_height * 8,
+                    &format!("Access code: {}", share.code),
+                    layout,
+                    palette.accent,
+                    palette.background,
+                    self.rotation,
+                );
+            }
+            framebuffer.text(
+                layout.margin_x,
+                layout.logical_height.saturating_sub(layout.line_height * 2),
+                "Enter start/stop · Ctrl+E or F2 back · read-only",
+                layout,
+                palette.muted,
+                palette.background,
+                self.rotation,
+            );
+            framebuffer.flush();
+            return Ok(());
+        }
+        if self.screen == Screen::Bluetooth {
+            let layout = framebuffer.layout(self.rotation, -3);
+            let panel = self.bluetooth_snapshot();
+            framebuffer.clear(palette.background, self.rotation);
+            framebuffer.text(
+                layout.margin_x,
+                layout.margin_y,
+                "Bluetooth keyboards",
+                layout,
+                palette.accent,
+                palette.background,
+                self.rotation,
+            );
+            framebuffer.text(
+                layout.margin_x,
+                layout.margin_y + layout.line_height * 2,
+                &panel.message,
+                layout,
+                palette.muted,
+                palette.background,
+                self.rotation,
+            );
+            let entries: Vec<String> = if panel.devices.is_empty() {
+                vec![match panel.phase {
+                    BluetoothPhase::Scanning => "Searching…".into(),
+                    _ => "No keyboards listed".into(),
+                }]
+            } else {
+                panel
+                    .devices
+                    .iter()
+                    .map(|device| {
+                        let status = if device.connected {
+                            "connected"
+                        } else if device.paired {
+                            "paired"
+                        } else {
+                            "available"
+                        };
+                        format!("{} · {status}", device.name)
+                    })
+                    .collect()
+            };
+            for (index, entry) in entries
+                .iter()
+                .take(layout.content_rows.saturating_sub(6))
+                .enumerate()
+            {
+                let y = layout.margin_y + layout.line_height * (4 + index);
+                let selected = !panel.devices.is_empty() && index == self.bluetooth_index;
+                if selected {
+                    framebuffer.rect(
+                        layout.margin_x / 2,
+                        y,
+                        layout.logical_width.saturating_sub(layout.margin_x),
+                        layout.line_height,
+                        palette.foreground,
+                        self.rotation,
+                    );
+                }
+                framebuffer.text(
+                    layout.margin_x,
+                    y,
+                    &format!("{}{}", if selected { "› " } else { "  " }, entry),
+                    layout,
+                    if selected {
+                        palette.background
+                    } else {
+                        palette.muted
+                    },
+                    if selected {
+                        palette.foreground
+                    } else {
+                        palette.background
+                    },
+                    self.rotation,
+                );
+            }
+            let footer = two_sided_line(
+                "↑↓ choose · Enter pair · r rescan · F12 back",
+                &self.info_bar(),
+                layout.columns,
+            );
+            framebuffer.text(
+                layout.margin_x,
+                layout.logical_height.saturating_sub(layout.line_height * 2),
+                &footer,
+                layout,
+                palette.muted,
+                palette.background,
+                self.rotation,
+            );
+            framebuffer.flush();
+            return Ok(());
+        }
         if self.screen != Screen::Editor {
             let layout = framebuffer.layout(self.rotation, -3);
             framebuffer.clear(palette.background, self.rotation);
@@ -1370,6 +1874,9 @@ impl App {
                     LockPrompt::Create => "Create Secret Thoughts password",
                     LockPrompt::Confirm => "Confirm password",
                     LockPrompt::Unlock => "Unlock Secret Thoughts",
+                    LockPrompt::ResetWarning => "Reset locked Secret Thoughts",
+                    LockPrompt::ResetCreate => "Create a new password",
+                    LockPrompt::ResetConfirm => "Confirm the new password",
                 };
                 let bullets = "*".repeat(self.password_input.chars().count());
                 framebuffer.text(
@@ -1470,9 +1977,9 @@ impl App {
                 );
             }
             let footer = if self.screen == Screen::Categories {
-                "↑↓ choose · Enter open · F5 theme · F7/F8 size"
+                "↑↓ open · F11 backup · F12 Bluetooth"
             } else {
-                "↑↓ choose · Enter open · Ctrl+N new · F2 back"
+                "↑↓ open · Ctrl+N new · r rename · F2 back"
             };
             let footer = two_sided_line(footer, &self.info_bar(), layout.columns);
             framebuffer.text(
@@ -1672,9 +2179,9 @@ impl App {
 
         let help_y = status_y + layout.line_height;
         let help_text = if layout.columns < 36 {
-            " F1 help · F5 · F6 "
+            " F1 help · Ctrl+E Wi-Fi "
         } else {
-            " F1 help · F5 theme · F6 rotate · F7 larger · F8 smaller "
+            " F1 help · F7/F8 size · F11 backup · F12 Bluetooth · Ctrl+E Wi-Fi "
         };
         let help = two_sided_line(help_text, &self.info_bar(), layout.columns);
         framebuffer.text(
@@ -1729,6 +2236,9 @@ impl App {
                     self.password_input.pop();
                 }
                 Key::Enter => self.submit_lock_prompt(),
+                Key::Char('!') if self.lock_prompt == Some(LockPrompt::Unlock) => {
+                    self.begin_secret_reset()
+                }
                 Key::Escape | Key::Browser => {
                     self.password_input.clear();
                     self.password_confirmation.clear();
@@ -1739,12 +2249,73 @@ impl App {
             }
             return Ok(true);
         }
+        if key == Key::WifiShare {
+            if self.screen == Screen::WifiShare {
+                self.close_wifi_share();
+            } else {
+                self.open_wifi_share();
+            }
+            return Ok(true);
+        }
+        if self.screen == Screen::WifiShare {
+            match key {
+                Key::Enter | Key::Char('s') => self.toggle_wifi_share(),
+                Key::Browser | Key::Escape => self.close_wifi_share(),
+                Key::Quit => {
+                    self.web_share.stop();
+                    self.save()?;
+                    if self.git_backup_enabled {
+                        self.run_git_backup();
+                    }
+                    return Ok(false);
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+        if key == Key::Bluetooth {
+            if self.screen == Screen::Bluetooth {
+                self.close_bluetooth();
+            } else {
+                self.open_bluetooth();
+            }
+            return Ok(true);
+        }
+        if self.screen == Screen::Bluetooth {
+            let device_count = self.bluetooth_snapshot().devices.len();
+            match key {
+                Key::Up => self.bluetooth_index = self.bluetooth_index.saturating_sub(1),
+                Key::Down if device_count > 0 => {
+                    self.bluetooth_index = (self.bluetooth_index + 1).min(device_count - 1)
+                }
+                Key::Enter => self.pair_selected_bluetooth(),
+                Key::Char('r') | Key::Redraw => {
+                    self.bluetooth_index = 0;
+                    self.start_bluetooth_scan();
+                }
+                Key::Browser | Key::Escape => self.close_bluetooth(),
+                Key::Quit => {
+                    self.cancel_bluetooth_pairing();
+                    self.save()?;
+                    if self.git_backup_enabled {
+                        self.run_git_backup();
+                    }
+                    return Ok(false);
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
         if self.screen != Screen::Editor {
             match key {
                 Key::Quit => {
                     self.save()?;
+                    if self.git_backup_enabled {
+                        self.run_git_backup();
+                    }
                     return Ok(false);
                 }
+                Key::GitBackup => self.toggle_git_backup()?,
                 Key::Theme => {
                     self.theme = (self.theme + 1) % THEMES.len() as u8;
                     self.save_display_config();
@@ -1788,9 +2359,7 @@ impl App {
                 Key::Char('/') if self.screen == Screen::Documents => {
                     self.start_prompt(TextPrompt::SearchSpace)
                 }
-                Key::Char('r') if self.screen == Screen::Documents => {
-                    self.start_prompt(TextPrompt::Rename)
-                }
+                Key::Char('r') if self.screen == Screen::Documents => self.start_rename_prompt(),
                 Key::Char('p') if self.screen == Screen::Documents => self.toggle_pin()?,
                 Key::Char('d') if self.screen == Screen::Documents => self.trash_selected()?,
                 Key::Char('v') if self.screen == Screen::Documents => self.select_reference()?,
@@ -1830,7 +2399,12 @@ impl App {
             Key::PageDown => self
                 .document
                 .move_visual_rows(page_width, page_height as isize),
-            Key::Save => self.save()?,
+            Key::Save => {
+                self.save()?;
+                if self.git_backup_enabled {
+                    self.run_git_backup();
+                }
+            }
             Key::Undo => {
                 self.message = if self.document.undo() {
                     "undo"
@@ -1873,6 +2447,9 @@ impl App {
             Key::New => self.new_note()?,
             Key::Quit => {
                 self.save()?;
+                if self.git_backup_enabled {
+                    self.run_git_backup();
+                }
                 return Ok(false);
             }
             Key::Help => self.help_visible = !self.help_visible,
@@ -1905,7 +2482,8 @@ impl App {
                 self.scroll = 0;
                 self.save_display_config();
             }
-            Key::Redraw | Key::Unknown => {}
+            Key::GitBackup => self.toggle_git_backup()?,
+            Key::Bluetooth | Key::WifiShare | Key::Redraw | Key::Unknown => {}
         }
         Ok(true)
     }
@@ -2189,6 +2767,695 @@ fn default_secret_lock_path() -> PathBuf {
     config_directory().join("secret.lock")
 }
 
+fn default_git_backup_config_path() -> PathBuf {
+    config_directory().join("git-backup.conf")
+}
+
+fn bluetoothctl_output(arguments: &[&str]) -> io::Result<std::process::Output> {
+    Command::new("bluetoothctl")
+        .args(arguments)
+        .output()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Bluetooth setup needs BlueZ bluetoothctl (install the bluez package)",
+            )
+        })
+}
+
+fn strip_terminal_codes(text: &str) -> String {
+    let mut clean = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        } else if !character.is_control() || matches!(character, '\n' | '\t') {
+            clean.push(character);
+        }
+    }
+    clean
+}
+
+fn valid_bluetooth_address(address: &str) -> bool {
+    let parts: Vec<_> = address.split(':').collect();
+    parts.len() == 6
+        && parts.iter().all(|part| {
+            part.len() == 2 && part.chars().all(|character| character.is_ascii_hexdigit())
+        })
+}
+
+fn parse_bluetooth_devices(text: &str) -> Vec<(String, String)> {
+    let mut devices = Vec::new();
+    for line in strip_terminal_codes(text).lines() {
+        let words: Vec<_> = line.split_whitespace().collect();
+        let Some(index) = words.iter().position(|word| *word == "Device") else {
+            continue;
+        };
+        let Some(address) = words
+            .get(index + 1)
+            .filter(|value| valid_bluetooth_address(value))
+        else {
+            continue;
+        };
+        let name = words[index + 2..].join(" ");
+        if !devices.iter().any(|(known, _)| known == address) {
+            devices.push(((*address).to_uppercase(), name));
+        }
+    }
+    devices
+}
+
+fn bluetooth_info_field(text: &str, field: &str) -> Option<String> {
+    strip_terminal_codes(text).lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(field)
+            .map(str::trim)
+            .map(str::to_owned)
+    })
+}
+
+fn bluetooth_info_is_keyboard(text: &str) -> bool {
+    let lower = strip_terminal_codes(text).to_lowercase();
+    lower.contains("icon: input-keyboard")
+        || lower.contains("human interface device")
+        || lower.contains("00001812-0000-1000-8000-00805f9b34fb")
+}
+
+fn bluetooth_info_flag(text: &str, field: &str) -> bool {
+    bluetooth_info_field(text, field).is_some_and(|value| value.eq_ignore_ascii_case("yes"))
+}
+
+fn prepare_bluetooth_adapter() -> io::Result<()> {
+    let version = bluetoothctl_output(&["--version"])?;
+    if !version.status.success() {
+        return Err(io::Error::other("Bluetooth control is unavailable"));
+    }
+    let powered = bluetoothctl_output(&["power", "on"])?;
+    let controller = bluetoothctl_output(&["show"])?;
+    if !powered.status.success()
+        || !controller.status.success()
+        || !bluetooth_info_flag(&String::from_utf8_lossy(&controller.stdout), "Powered:")
+    {
+        return Err(io::Error::other(
+            "Could not power on Bluetooth; check the adapter and user permissions",
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_bluetooth_keyboard(
+    address: String,
+    advertised_name: String,
+) -> io::Result<Option<BluetoothDevice>> {
+    let info = bluetoothctl_output(&["info", &address])?;
+    if !info.status.success() {
+        return Ok(None);
+    }
+    let info = String::from_utf8_lossy(&info.stdout);
+    if !bluetooth_info_is_keyboard(&info) {
+        return Ok(None);
+    }
+    let name = bluetooth_info_field(&info, "Alias:")
+        .or_else(|| bluetooth_info_field(&info, "Name:"))
+        .filter(|name| !name.is_empty())
+        .unwrap_or(advertised_name);
+    Ok(Some(BluetoothDevice {
+        address,
+        name: if name.is_empty() {
+            "Keyboard".into()
+        } else {
+            name
+        },
+        paired: bluetooth_info_flag(&info, "Paired:"),
+        connected: bluetooth_info_flag(&info, "Connected:"),
+    }))
+}
+
+fn known_bluetooth_keyboards() -> io::Result<Vec<BluetoothDevice>> {
+    let listed = bluetoothctl_output(&["devices"])?;
+    let mut paired = bluetoothctl_output(&["devices", "Paired"])?;
+    if !paired.status.success() {
+        paired = bluetoothctl_output(&["paired-devices"])?;
+    }
+    let mut discovered = parse_bluetooth_devices(&String::from_utf8_lossy(&listed.stdout));
+    discovered.extend(parse_bluetooth_devices(&String::from_utf8_lossy(
+        &paired.stdout,
+    )));
+    discovered.sort_by(|left, right| left.0.cmp(&right.0));
+    discovered.dedup_by(|left, right| left.0 == right.0);
+
+    let mut keyboards = Vec::new();
+    for (address, advertised_name) in discovered {
+        if let Some(device) = inspect_bluetooth_keyboard(address, advertised_name)? {
+            keyboards.push(device);
+        }
+    }
+    keyboards.sort_by(|left, right| {
+        right
+            .connected
+            .cmp(&left.connected)
+            .then_with(|| right.paired.cmp(&left.paired))
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    Ok(keyboards)
+}
+
+fn bluetooth_scan_is_current(
+    cancelled: &AtomicBool,
+    active_generation: &AtomicU64,
+    generation: u64,
+) -> bool {
+    !cancelled.load(Ordering::Relaxed) && active_generation.load(Ordering::Relaxed) == generation
+}
+
+fn publish_bluetooth_keyboard(state: &Mutex<BluetoothPanel>, device: BluetoothDevice) {
+    if let Ok(mut panel) = state.lock() {
+        if panel
+            .devices
+            .iter()
+            .any(|known| known.address == device.address)
+        {
+            return;
+        }
+        panel.devices.push(device);
+        panel.message = format!(
+            "Found {} keyboard{} · select one now or keep waiting",
+            panel.devices.len(),
+            if panel.devices.len() == 1 { "" } else { "s" }
+        );
+    }
+}
+
+fn stream_bluetooth_keyboards(
+    state: Arc<Mutex<BluetoothPanel>>,
+    process: Arc<Mutex<Option<Child>>>,
+    cancelled: Arc<AtomicBool>,
+    active_generation: Arc<AtomicU64>,
+    generation: u64,
+) {
+    let result = (|| -> io::Result<()> {
+        prepare_bluetooth_adapter()?;
+        let known = known_bluetooth_keyboards()?;
+        let mut added: HashSet<String> = HashSet::new();
+        for device in known {
+            if !bluetooth_scan_is_current(&cancelled, &active_generation, generation) {
+                return Ok(());
+            }
+            added.insert(device.address.clone());
+            publish_bluetooth_keyboard(&state, device);
+        }
+
+        let mut child = Command::new("bluetoothctl")
+            .args(["--timeout", "20", "scan", "on"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| io::Error::other("Could not start Bluetooth discovery"))?;
+        let stdout = child.stdout.take();
+        if let Ok(mut active) = process.lock() {
+            *active = Some(child);
+            if !bluetooth_scan_is_current(&cancelled, &active_generation, generation) {
+                if let Some(child) = active.as_mut() {
+                    let _ = child.kill();
+                }
+            }
+        }
+
+        let mut output = String::new();
+        let mut last_checked: HashMap<String, Instant> = HashMap::new();
+        if let Some(mut stdout) = stdout {
+            let mut buffer = [0_u8; 512];
+            loop {
+                if !bluetooth_scan_is_current(&cancelled, &active_generation, generation) {
+                    break;
+                }
+                let count = match stdout.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(_) => break,
+                };
+                output.push_str(&String::from_utf8_lossy(&buffer[..count]));
+                for (address, advertised_name) in parse_bluetooth_devices(&output) {
+                    if added.contains(&address) {
+                        continue;
+                    }
+                    let should_check = last_checked
+                        .get(&address)
+                        .is_none_or(|checked| checked.elapsed() >= Duration::from_millis(500));
+                    if !should_check {
+                        continue;
+                    }
+                    last_checked.insert(address.clone(), Instant::now());
+                    if let Some(device) =
+                        inspect_bluetooth_keyboard(address.clone(), advertised_name)?
+                    {
+                        added.insert(address);
+                        publish_bluetooth_keyboard(&state, device);
+                    }
+                }
+            }
+        }
+        if let Ok(mut active) = process.lock() {
+            if let Some(mut child) = active.take() {
+                let _ = child.wait();
+            }
+        }
+        Ok(())
+    })();
+
+    if !bluetooth_scan_is_current(&cancelled, &active_generation, generation) {
+        return;
+    }
+    if let Ok(mut panel) = state.lock() {
+        match result {
+            Ok(()) => {
+                panel.phase = BluetoothPhase::Ready;
+                panel.message = if panel.devices.is_empty() {
+                    "No keyboards found. Keep pairing mode active and press r to rescan".into()
+                } else {
+                    "Scan complete · select a keyboard and press Enter".into()
+                };
+            }
+            Err(error) => {
+                panel.phase = BluetoothPhase::Error;
+                panel.message = error.to_string();
+            }
+        }
+    }
+}
+
+fn pairing_passkey(line: &str) -> Option<String> {
+    let line = strip_terminal_codes(line);
+    let marker = line.find("Passkey:")?;
+    let digits: String = line[marker + "Passkey:".len()..]
+        .chars()
+        .skip_while(|character| !character.is_ascii_digit())
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    (!digits.is_empty()).then_some(digits)
+}
+
+fn bluetooth_pairing_error(output: &str) -> String {
+    let lower = strip_terminal_codes(output).to_lowercase();
+    if lower.contains("authenticationfailed") || lower.contains("authentication failed") {
+        "Pairing failed: the passkey was rejected. Put the keyboard in pairing mode and retry"
+            .into()
+    } else if lower.contains("authenticationcanceled") || lower.contains("authentication canceled")
+    {
+        "Pairing was cancelled by the keyboard".into()
+    } else if lower.contains("alreadyexists") || lower.contains("already exists") {
+        "A stale pairing already exists. Forget the keyboard in the OS Bluetooth settings, then retry"
+            .into()
+    } else if lower.contains("notavailable") || lower.contains("not available") {
+        "Pairing failed: the Bluetooth adapter or keyboard is unavailable".into()
+    } else {
+        "Pairing timed out. Put the keyboard in pairing mode, keep it close, and retry".into()
+    }
+}
+
+fn pair_bluetooth_keyboard(
+    device: BluetoothDevice,
+    state: Arc<Mutex<BluetoothPanel>>,
+    process: Arc<Mutex<Option<Child>>>,
+    cancelled: Arc<AtomicBool>,
+) {
+    let mut child = match Command::new("bluetoothctl")
+        .args([
+            "--agent",
+            "DisplayOnly",
+            "--timeout",
+            "40",
+            "pair",
+            &device.address,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => {
+            if let Ok(mut panel) = state.lock() {
+                panel.phase = BluetoothPhase::Error;
+                panel.message = "Could not start bluetoothctl".into();
+            }
+            return;
+        }
+    };
+    let mut output = String::new();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    if let Ok(mut active) = process.lock() {
+        *active = Some(child);
+        if cancelled.load(Ordering::Relaxed) {
+            if let Some(child) = active.as_mut() {
+                let _ = child.kill();
+            }
+        }
+    }
+    let stderr_reader = stderr.map(|mut stderr| {
+        thread::spawn(move || {
+            let mut contents = String::new();
+            let _ = stderr.read_to_string(&mut contents);
+            contents
+        })
+    });
+    if let Some(mut stdout) = stdout {
+        let mut buffer = [0_u8; 256];
+        let mut shown_passkey = None;
+        loop {
+            let count = match stdout.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(_) => break,
+            };
+            output.push_str(&String::from_utf8_lossy(&buffer[..count]));
+            if let Some(passkey) = pairing_passkey(&output) {
+                if shown_passkey.as_ref() != Some(&passkey) {
+                    shown_passkey = Some(passkey.clone());
+                    if let Ok(mut panel) = state.lock() {
+                        panel.message =
+                            format!("Type {passkey} on the Bluetooth keyboard, then press Enter");
+                    }
+                }
+            }
+        }
+    }
+    if let Some(stderr_reader) = stderr_reader {
+        if let Ok(stderr) = stderr_reader.join() {
+            output.push_str(&stderr);
+        }
+    }
+    let status = process
+        .lock()
+        .ok()
+        .and_then(|mut active| active.take())
+        .and_then(|mut child| child.wait().ok());
+    if cancelled.load(Ordering::Relaxed) {
+        return;
+    }
+    let paired = status.is_some_and(|status| status.success())
+        && bluetoothctl_output(&["info", &device.address])
+            .ok()
+            .is_some_and(|info| {
+                bluetooth_info_flag(&String::from_utf8_lossy(&info.stdout), "Paired:")
+            });
+    if !paired {
+        if let Ok(mut panel) = state.lock() {
+            panel.phase = BluetoothPhase::Error;
+            panel.message = bluetooth_pairing_error(&output);
+        }
+        return;
+    }
+
+    let _ = bluetoothctl_output(&["trust", &device.address]);
+    let _ = bluetoothctl_output(&["connect", &device.address]);
+    let final_info = bluetoothctl_output(&["info", &device.address])
+        .ok()
+        .map(|result| String::from_utf8_lossy(&result.stdout).into_owned())
+        .unwrap_or_default();
+    let trusted = bluetooth_info_flag(&final_info, "Trusted:");
+    let connected = bluetooth_info_flag(&final_info, "Connected:");
+    if let Ok(mut panel) = state.lock() {
+        if let Some(saved) = panel
+            .devices
+            .iter_mut()
+            .find(|saved| saved.address == device.address)
+        {
+            saved.paired = true;
+            saved.connected = connected;
+        }
+        panel.phase = BluetoothPhase::Ready;
+        panel.message = if connected && trusted {
+            format!("{} paired, trusted, and connected", device.name)
+        } else if trusted {
+            format!(
+                "{} paired and trusted; press Enter to retry connection",
+                device.name
+            )
+        } else {
+            format!(
+                "{} paired; Bluetooth could not mark it trusted",
+                device.name
+            )
+        };
+    }
+}
+
+fn read_git_backup_config(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|contents| {
+            contents
+                .lines()
+                .any(|line| line.trim().eq_ignore_ascii_case("enabled=true"))
+        })
+        .unwrap_or(false)
+}
+
+fn write_git_backup_config(path: &Path, enabled: bool) -> io::Result<()> {
+    atomic_write(path, format!("enabled={enabled}\n").as_bytes())
+}
+
+fn git_available() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitBackupResult {
+    Pushed,
+    LocalOnly { changed: bool },
+    NoChanges,
+}
+
+fn run_git(directory: &Path, arguments: &[&str]) -> io::Result<std::process::Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .output()
+        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "git is not installed"))
+}
+
+fn git_success(directory: &Path, arguments: &[&str], action: &str) -> io::Result<()> {
+    let output = run_git(directory, arguments)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("could not {action}")))
+    }
+}
+
+fn ensure_git_repository(directory: &Path) -> io::Result<()> {
+    fs::create_dir_all(directory)?;
+    if !directory.join(".git").exists() {
+        git_success(
+            directory,
+            &["init", "--quiet"],
+            "initialize the writing repository",
+        )?;
+    }
+    let output = run_git(directory, &["rev-parse", "--show-toplevel"])?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "the writing folder is not a Git repository",
+        ));
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let root = fs::canonicalize(root)
+        .map_err(|_| io::Error::other("could not verify the Git repository root"))?;
+    let writing = fs::canonicalize(directory)?;
+    if root != writing {
+        return Err(io::Error::other(
+            "refusing to back up through a parent Git repository",
+        ));
+    }
+    Ok(())
+}
+
+fn secret_lock_backup_path(directory: &Path) -> PathBuf {
+    directory.join(".quietwrite/git-secret.lock")
+}
+
+fn restore_secret_lock_backup(directory: &Path, lock_path: &Path) -> io::Result<()> {
+    let backup = secret_lock_backup_path(directory);
+    if lock_path.exists() || !backup.exists() {
+        return Ok(());
+    }
+    let bytes = fs::read(backup)?;
+    atomic_write(lock_path, &bytes)?;
+    #[cfg(unix)]
+    fs::set_permissions(lock_path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn backup_secret_lock(directory: &Path, lock_path: &Path) -> io::Result<Option<PathBuf>> {
+    if !lock_path.exists() {
+        return Ok(None);
+    }
+    let destination = secret_lock_backup_path(directory);
+    let bytes = fs::read(lock_path)?;
+    atomic_write(&destination, &bytes)?;
+    #[cfg(unix)]
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
+    Ok(Some(destination))
+}
+
+fn ordinary_backup_path(relative: &Path) -> bool {
+    if relative.extension().and_then(|value| value.to_str()) != Some("md") {
+        return false;
+    }
+    let mut components = relative.components();
+    let Some(first) = components.next() else {
+        return false;
+    };
+    if components.next().is_none() {
+        return true;
+    }
+    let first = Path::new(first.as_os_str()).to_string_lossy();
+    ORDINARY_FOLDERS.iter().any(|folder| *folder == first)
+        || first == "Poems"
+        || first == "Secret Thoughts"
+}
+
+fn safe_secret_ciphertext(path: &Path) -> bool {
+    fs::read(path)
+        .map(|bytes| bytes.starts_with(SECRET_MAGIC))
+        .unwrap_or(false)
+}
+
+fn git_backup_paths(directory: &Path, lock_path: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths = HashSet::new();
+    for path in notes_for_category(directory, 0) {
+        if let Ok(relative) = path.strip_prefix(directory) {
+            paths.insert(relative.to_path_buf());
+        }
+    }
+    for path in notes_for_category(directory, SECRET_CATEGORY_INDEX) {
+        if safe_secret_ciphertext(&path) {
+            if let Ok(relative) = path.strip_prefix(directory) {
+                paths.insert(relative.to_path_buf());
+            }
+        }
+    }
+    if let Some(path) = backup_secret_lock(directory, lock_path)? {
+        if let Ok(relative) = path.strip_prefix(directory) {
+            paths.insert(relative.to_path_buf());
+        }
+    }
+
+    let tracked = run_git(directory, &["ls-files", "-z"])?;
+    if tracked.status.success() {
+        for name in tracked
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+        {
+            let relative = PathBuf::from(String::from_utf8_lossy(name).into_owned());
+            if relative == Path::new(".quietwrite/git-secret.lock") {
+                paths.insert(relative);
+            } else if ordinary_backup_path(&relative) {
+                let full = directory.join(&relative);
+                if !relative.starts_with("Secret Thoughts")
+                    || !full.exists()
+                    || safe_secret_ciphertext(&full)
+                {
+                    paths.insert(relative);
+                }
+            }
+        }
+    }
+    let mut paths: Vec<_> = paths.into_iter().collect();
+    paths.sort();
+    Ok(paths)
+}
+
+fn git_backup(directory: &Path, lock_path: &Path) -> io::Result<GitBackupResult> {
+    if !git_available() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "git is not installed",
+        ));
+    }
+    ensure_git_repository(directory)?;
+    let paths = git_backup_paths(directory, lock_path)?;
+    if !paths.is_empty() {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(directory).args(["add", "-A", "--"]);
+        command.args(&paths).env("GIT_TERMINAL_PROMPT", "0");
+        if !command.status()?.success() {
+            return Err(io::Error::other("could not stage the writing snapshot"));
+        }
+    }
+
+    let staged = run_git(directory, &["diff", "--cached", "--quiet"])?;
+    let changed = match staged.status.code() {
+        Some(0) => false,
+        Some(1) => true,
+        _ => return Err(io::Error::other("could not inspect the writing snapshot")),
+    };
+    if changed {
+        let message = format!(
+            "QuietWrite backup {}",
+            Local::now().format("%Y-%m-%d %H:%M")
+        );
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args([
+                "-c",
+                "user.name=QuietWrite Backup",
+                "-c",
+                "user.email=quietwrite@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--no-verify",
+                "-m",
+            ])
+            .arg(message)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("could not commit the writing snapshot"));
+        }
+    }
+
+    let remote = run_git(directory, &["remote", "get-url", "origin"])?;
+    if !remote.status.success() {
+        return Ok(GitBackupResult::LocalOnly { changed });
+    }
+    let pushed = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["push", "-u", "origin", "HEAD"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .output()?;
+    if !pushed.status.success() {
+        return Err(io::Error::other(
+            "snapshot saved locally, but push failed; check origin, authentication, or remote history",
+        ));
+    }
+    Ok(if changed {
+        GitBackupResult::Pushed
+    } else {
+        GitBackupResult::NoChanges
+    })
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -2210,6 +3477,54 @@ fn hex_decode(text: &str) -> io::Result<Vec<u8>> {
 }
 
 const SECRET_MAGIC: &[u8] = b"QWSECRET1\0";
+
+fn archive_secret_vault(
+    directory: &Path,
+    lock_path: &Path,
+    now: SystemTime,
+) -> io::Result<PathBuf> {
+    let seconds = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let archive = directory
+        .join(".quietwrite")
+        .join(format!("secret-recovery-{seconds}"));
+    if archive.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "recovery archive already exists",
+        ));
+    }
+    fs::create_dir_all(&archive)?;
+    let vault = directory.join(CATEGORIES[SECRET_CATEGORY_INDEX].1);
+    let archived_vault = archive.join("Secret Thoughts");
+    if vault.exists() {
+        if let Err(error) = fs::rename(&vault, &archived_vault) {
+            let _ = fs::remove_dir_all(&archive);
+            return Err(error);
+        }
+    }
+    if lock_path.exists() {
+        let archived_lock = archive.join("secret.lock");
+        if let Err(error) = fs::copy(lock_path, &archived_lock) {
+            if archived_vault.exists() {
+                let _ = fs::rename(&archived_vault, &vault);
+            }
+            let _ = fs::remove_dir_all(&archive);
+            return Err(error);
+        }
+        #[cfg(unix)]
+        fs::set_permissions(&archived_lock, fs::Permissions::from_mode(0o600))?;
+        if let Err(error) = fs::remove_file(lock_path) {
+            if archived_vault.exists() {
+                let _ = fs::rename(&archived_vault, &vault);
+            }
+            let _ = fs::remove_file(&archived_lock);
+            let _ = fs::remove_dir_all(&archive);
+            return Err(error);
+        }
+    }
+    fs::create_dir_all(&vault)?;
+    Ok(archive)
+}
 
 fn password_material(password: &[u8], salt: &[u8]) -> io::Result<[u8; 64]> {
     let params = Params::new(19456, 2, 1, Some(64))
@@ -2382,6 +3697,14 @@ fn draw_tui(frame: &mut Frame, app: &mut App) {
         .fg(tui_color(palette.foreground));
     frame.render_widget(Block::default().style(background), area);
 
+    if app.screen == Screen::WifiShare {
+        draw_tui_wifi_share(frame, app, area, palette);
+        return;
+    }
+    if app.screen == Screen::Bluetooth {
+        draw_tui_bluetooth(frame, app, area, palette);
+        return;
+    }
     if app.screen != Screen::Editor {
         draw_tui_browser(frame, app, area, palette);
         draw_text_prompt(frame, app, area, palette);
@@ -2576,7 +3899,7 @@ fn draw_tui(frame: &mut Frame, app: &mut App) {
     draw_info_bar(
         frame,
         app,
-        " F1 help · F2 browse · F9 outline · F10 split · Ctrl+↑/↓ headings · Ctrl+S save ",
+        " F1 help · F2 browse · F11 backup · F12 Bluetooth · Ctrl+E Wi-Fi · Ctrl+S save ",
         chunks[2],
         palette,
     );
@@ -2615,6 +3938,9 @@ fn draw_tui(frame: &mut Frame, app: &mut App) {
             Line::from("F5       Change theme"),
             Line::from("F9       Toggle outline"),
             Line::from("F10      Toggle reference split"),
+            Line::from("F11      Toggle Git backup"),
+            Line::from("F12      Pair Bluetooth keyboard"),
+            Line::from("Ctrl+E   Read-only Wi-Fi note library"),
             Line::from("Ctrl+↑/↓ Previous / next heading"),
             Line::from("F1 / Esc Close help"),
         ])
@@ -2673,6 +3999,152 @@ fn draw_info_bar(frame: &mut Frame, app: &App, left: &str, area: Rect, palette: 
             .alignment(Alignment::Right)
             .style(style),
         sections[1],
+    );
+}
+
+fn draw_tui_wifi_share(frame: &mut Frame, app: &App, area: Rect, palette: ThemePalette) {
+    let share = app.web_share.snapshot();
+    let text = if share.running || share.starting {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                share.message,
+                Style::default().fg(tui_color(palette.muted)),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                share.url,
+                Style::default()
+                    .fg(tui_color(palette.foreground))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("Access code: {}", share.code),
+                Style::default()
+                    .fg(tui_color(palette.accent))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("Ordinary Markdown only · read-only · no upload or delete"),
+        ]
+    } else {
+        vec![
+            Line::from(""),
+            Line::from(share.message),
+            Line::from(""),
+            Line::from("Press Enter to start sharing ordinary notes."),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .style(
+                Style::default()
+                    .fg(tui_color(palette.foreground))
+                    .bg(tui_color(palette.background)),
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Wi-Fi note library "),
+            ),
+        area,
+    );
+    let footer = Rect {
+        x: area.x.saturating_add(2),
+        y: area.y.saturating_add(area.height.saturating_sub(2)),
+        width: area.width.saturating_sub(4),
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new("Enter start/stop · Ctrl+E/F2/Esc back")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(tui_color(palette.muted))),
+        footer,
+    );
+}
+
+fn draw_tui_bluetooth(frame: &mut Frame, app: &App, area: Rect, palette: ThemePalette) {
+    let panel = app.bluetooth_snapshot();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new("Bluetooth keyboards")
+            .alignment(Alignment::Center)
+            .style(
+                Style::default()
+                    .fg(tui_color(palette.accent))
+                    .bg(tui_color(palette.background))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(Block::default().borders(Borders::BOTTOM)),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(" {}", panel.message)).style(
+            Style::default()
+                .fg(tui_color(palette.muted))
+                .bg(tui_color(palette.background)),
+        ),
+        chunks[1],
+    );
+    let entries: Vec<ListItem> = if panel.devices.is_empty() {
+        vec![ListItem::new(match panel.phase {
+            BluetoothPhase::Scanning => "  Searching…",
+            _ => "  No keyboards listed",
+        })]
+    } else {
+        panel
+            .devices
+            .iter()
+            .map(|device| {
+                let status = if device.connected {
+                    "connected"
+                } else if device.paired {
+                    "paired"
+                } else {
+                    "available"
+                };
+                ListItem::new(format!(
+                    "  {}  ·  {status}\n     {}",
+                    device.name, device.address
+                ))
+            })
+            .collect()
+    };
+    let mut state = ListState::default().with_selected(
+        (!panel.devices.is_empty()).then_some(app.bluetooth_index.min(panel.devices.len() - 1)),
+    );
+    let list = List::new(entries)
+        .highlight_symbol("› ")
+        .highlight_style(
+            Style::default()
+                .fg(tui_color(palette.background))
+                .bg(tui_color(palette.foreground))
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(
+            Style::default()
+                .fg(tui_color(palette.muted))
+                .bg(tui_color(palette.background)),
+        )
+        .block(Block::default().borders(Borders::LEFT | Borders::RIGHT));
+    frame.render_stateful_widget(list, chunks[2], &mut state);
+    draw_info_bar(
+        frame,
+        app,
+        " ↑↓ choose · Enter pair/connect · r rescan · F12/F2 back ",
+        chunks[3],
+        palette,
     );
 }
 
@@ -2755,9 +4227,9 @@ fn draw_tui_browser(frame: &mut Frame, app: &mut App, area: Rect, palette: Theme
     frame.render_stateful_widget(list, chunks[1], &mut state);
     let footer = if app.screen == Screen::Categories {
         if app.category_index == SECRET_CATEGORY_INDEX {
-            " ↑↓ choose · Enter unlock · F5 theme · F7/F8 size on Pi · encrypted "
+            " ↑↓ choose · Enter unlock · F12 Bluetooth · Ctrl+E Wi-Fi · encrypted "
         } else {
-            " ↑↓ choose · Enter open · F5 theme · F7/F8 size on Pi · Ctrl+Q quit "
+            " ↑↓ open · F11 backup · F12 Bluetooth · Ctrl+E Wi-Fi · Ctrl+Q quit "
         }
     } else {
         " ↑↓ open · v reference · / search · p pin · r rename · d trash · F2 back "
@@ -2770,6 +4242,9 @@ fn draw_tui_browser(frame: &mut Frame, app: &mut App, area: Rect, palette: Theme
             LockPrompt::Create => " Create Secret Thoughts password ",
             LockPrompt::Confirm => " Confirm password ",
             LockPrompt::Unlock => " Unlock Secret Thoughts ",
+            LockPrompt::ResetWarning => " Reset locked Secret Thoughts ",
+            LockPrompt::ResetCreate => " Create a new password ",
+            LockPrompt::ResetConfirm => " Confirm the new password ",
         };
         let bullets = "•".repeat(app.password_input.chars().count());
         let content = vec![
@@ -2812,6 +4287,7 @@ fn crossterm_key(event: KeyEvent) -> Key {
             KeyCode::Char('r') => Key::Restore,
             KeyCode::Char('f') => Key::Search,
             KeyCode::Char('g') => Key::Target,
+            KeyCode::Char('e') => Key::WifiShare,
             KeyCode::Char('k') => Key::PreviousHeading,
             KeyCode::Char('j') => Key::NextHeading,
             KeyCode::Up => Key::PreviousHeading,
@@ -2843,6 +4319,8 @@ fn crossterm_key(event: KeyEvent) -> Key {
         KeyCode::F(8) => Key::Smaller,
         KeyCode::F(9) => Key::Outline,
         KeyCode::F(10) => Key::SplitView,
+        KeyCode::F(11) => Key::GitBackup,
+        KeyCode::F(12) => Key::Bluetooth,
         KeyCode::Tab => Key::Char('\t'),
         _ => Key::Unknown,
     }
@@ -2905,6 +4383,9 @@ fn run_tui(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
             app.save()?;
             changed = true;
         }
+        if app.maybe_git_backup() {
+            changed = true;
+        }
         if !changed {
             continue;
         }
@@ -2921,6 +4402,8 @@ fn run_framebuffer(
     let mut pending = Vec::new();
     let mut input = io::stdin();
     let mut shown_network = app.network_status.load(Ordering::Relaxed);
+    let mut shown_bluetooth = app.bluetooth_snapshot();
+    let mut shown_share = app.web_share.snapshot();
     app.render_framebuffer(&mut framebuffer)?;
     loop {
         app.refresh_network_if_due();
@@ -2952,9 +4435,22 @@ fn run_framebuffer(
             app.save()?;
             changed = true;
         }
+        if app.maybe_git_backup() {
+            changed = true;
+        }
         let network = app.network_status.load(Ordering::Relaxed);
         if network != shown_network {
             shown_network = network;
+            changed = true;
+        }
+        let bluetooth = app.bluetooth_snapshot();
+        if bluetooth != shown_bluetooth {
+            shown_bluetooth = bluetooth;
+            changed = true;
+        }
+        let share = app.web_share.snapshot();
+        if share != shown_share {
+            shown_share = share;
             changed = true;
         }
         if changed {
@@ -3206,6 +4702,92 @@ mod tests {
     }
 
     #[test]
+    fn function_key_toggles_git_backup() {
+        let mut bytes = b"\x1b[23~".to_vec();
+        assert_eq!(decode_key(&mut bytes), Some(Key::GitBackup));
+        assert_eq!(
+            crossterm_key(KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE)),
+            Key::GitBackup
+        );
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn function_key_opens_bluetooth_keyboard_setup() {
+        let mut bytes = b"\x1b[24~".to_vec();
+        assert_eq!(decode_key(&mut bytes), Some(Key::Bluetooth));
+        assert_eq!(
+            crossterm_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)),
+            Key::Bluetooth
+        );
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn control_e_opens_wifi_note_library() {
+        let mut bytes = vec![5];
+        assert_eq!(decode_key(&mut bytes), Some(Key::WifiShare));
+        assert_eq!(
+            crossterm_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            Key::WifiShare
+        );
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn bluetooth_output_parser_finds_and_deduplicates_devices() {
+        let output = "\u{1b}[0;92m[NEW]\u{1b}[0m Device AA:BB:CC:DD:EE:FF Writer Keys\n\
+                      [CHG] Device AA:BB:CC:DD:EE:FF RSSI: -40\n\
+                      Device 11:22:33:44:55:66 Pocket Keyboard\n";
+        assert_eq!(
+            parse_bluetooth_devices(output),
+            vec![
+                ("AA:BB:CC:DD:EE:FF".into(), "Writer Keys".into()),
+                ("11:22:33:44:55:66".into(), "Pocket Keyboard".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn bluetooth_info_identifies_keyboards_and_pairing_state() {
+        let info = "Device AA:BB:CC:DD:EE:FF\n\
+                    Name: Quiet Keys\n\
+                    Alias: Quiet Keys\n\
+                    Icon: input-keyboard\n\
+                    Paired: yes\n\
+                    Connected: no\n\
+                    UUID: Human Interface Device (00001124-0000-1000-8000-00805f9b34fb)\n";
+        assert!(bluetooth_info_is_keyboard(info));
+        assert!(bluetooth_info_flag(info, "Paired:"));
+        assert!(!bluetooth_info_flag(info, "Connected:"));
+        assert_eq!(
+            bluetooth_info_field(info, "Alias:").as_deref(),
+            Some("Quiet Keys")
+        );
+        assert!(!bluetooth_info_is_keyboard(
+            "Icon: audio-card\nUUID: Audio Sink"
+        ));
+    }
+
+    #[test]
+    fn pairing_passkey_is_extracted_for_display() {
+        assert_eq!(
+            pairing_passkey(
+                "\u{1b}[0;93m[agent] Passkey: 482913\r[agent] Passkey: 482913 (entered 1)"
+            ),
+            Some("482913".into())
+        );
+        assert_eq!(pairing_passkey("Pairing successful"), None);
+        assert!(
+            bluetooth_pairing_error("org.bluez.Error.AuthenticationFailed")
+                .contains("passkey was rejected")
+        );
+        assert!(
+            bluetooth_pairing_error("org.bluez.Error.AuthenticationTimeout").contains("timed out")
+        );
+    }
+
+    #[test]
     fn control_arrows_navigate_headings_without_reserved_function_keys() {
         let mut bytes = b"\x1b[1;5A\x1b[1;5B".to_vec();
         assert_eq!(decode_key(&mut bytes), Some(Key::PreviousHeading));
@@ -3224,8 +4806,12 @@ mod tests {
     #[test]
     fn information_bar_reports_connection_without_exceeding_width() {
         let directory = test_directory("info-bar");
-        let app = App::open(directory.clone(), None, false).unwrap();
+        let mut app = App::open(directory.clone(), None, false).unwrap();
+        app.git_backup_enabled = false;
         app.network_status.store(2, Ordering::Relaxed);
+        assert!(app
+            .info_bar()
+            .contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
         assert!(app.info_bar().ends_with("● online"));
         let line = two_sided_line("shortcuts", &app.info_bar(), 40);
         assert_eq!(visible_width(&line), 40);
@@ -3287,6 +4873,53 @@ mod tests {
         assert!(!notes_for_category(&directory, 0)
             .iter()
             .any(|path| path.ends_with("other.md")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn browser_rename_prefills_preserves_pins_and_refuses_collisions() {
+        let directory = test_directory("rename");
+        let notes = directory.join("Notes");
+        let original = notes.join("first draft.md");
+        let occupied = notes.join("existing.md");
+        atomic_write(&original, b"keep these words").unwrap();
+        atomic_write(&occupied, b"do not overwrite").unwrap();
+        let mut app = App::open(directory.clone(), None, false).unwrap();
+        app.git_backup_enabled = false;
+        app.category_index = 0;
+        app.open_category();
+        app.document_index = app
+            .documents
+            .iter()
+            .position(|path| path == &original)
+            .unwrap();
+        app.toggle_pin().unwrap();
+        app.document_index = app
+            .documents
+            .iter()
+            .position(|path| path == &original)
+            .unwrap();
+
+        app.start_rename_prompt();
+        assert_eq!(app.prompt_input, "first draft");
+        app.prompt_input = "finished draft.md".into();
+        app.submit_text_prompt().unwrap();
+        let renamed = notes.join("finished draft.md");
+        assert!(!original.exists());
+        assert_eq!(fs::read_to_string(&renamed).unwrap(), "keep these words");
+        assert!(app.pinned.contains(&renamed));
+
+        app.document_index = app
+            .documents
+            .iter()
+            .position(|path| path == &renamed)
+            .unwrap();
+        app.start_rename_prompt();
+        app.prompt_input = "existing".into();
+        app.submit_text_prompt().unwrap();
+        assert_eq!(app.message, "a note with that name already exists");
+        assert_eq!(fs::read_to_string(&renamed).unwrap(), "keep these words");
+        assert_eq!(fs::read_to_string(&occupied).unwrap(), "do not overwrite");
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3510,6 +5143,138 @@ Reference"
         assert!(app.secret_unlocked);
         app.handle(Key::Escape, 20, 80).unwrap();
         assert!(!app.secret_unlocked);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn git_backup_config_is_opt_in() {
+        let directory = test_directory("git-config");
+        let path = directory.join("git-backup.conf");
+        assert!(!read_git_backup_config(&path));
+        write_git_backup_config(&path, true).unwrap();
+        assert!(read_git_backup_config(&path));
+        write_git_backup_config(&path, false).unwrap();
+        assert!(!read_git_backup_config(&path));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn git_backup_creates_one_local_snapshot_and_skips_volatile_data() {
+        if !git_available() {
+            return;
+        }
+        let directory = test_directory("git-backup");
+        let lock = directory.join("config/secret.lock");
+        atomic_write(&directory.join("Notes/draft.md"), b"ordinary words").unwrap();
+        atomic_write(&directory.join(".quietwrite/history/old.md"), b"old words").unwrap();
+        atomic_write(&directory.join(".quietwrite/Trash/deleted.md"), b"deleted").unwrap();
+        let key = create_secret_lock(&lock, b"a strong sample password").unwrap();
+        let ciphertext = encrypt_secret(&key, b"private words").unwrap();
+        atomic_write(&directory.join("Secret Thoughts/private.md"), &ciphertext).unwrap();
+
+        assert_eq!(
+            git_backup(&directory, &lock).unwrap(),
+            GitBackupResult::LocalOnly { changed: true }
+        );
+        let tracked = run_git(&directory, &["ls-files"]).unwrap();
+        let tracked = String::from_utf8(tracked.stdout).unwrap();
+        assert!(tracked.contains("Notes/draft.md"));
+        assert!(tracked.contains("Secret Thoughts/private.md"));
+        assert!(tracked.contains(".quietwrite/git-secret.lock"));
+        assert!(!tracked.contains("history"));
+        assert!(!tracked.contains("Trash"));
+
+        assert_eq!(
+            git_backup(&directory, &lock).unwrap(),
+            GitBackupResult::LocalOnly { changed: false }
+        );
+        let count = run_git(&directory, &["rev-list", "--count", "HEAD"]).unwrap();
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn git_backup_never_commits_plaintext_secret_thoughts() {
+        if !git_available() {
+            return;
+        }
+        let directory = test_directory("git-plaintext-secret");
+        atomic_write(
+            &directory.join("Secret Thoughts/private.md"),
+            b"not encrypted yet",
+        )
+        .unwrap();
+        assert_eq!(
+            git_backup(&directory, &directory.join("missing.lock")).unwrap(),
+            GitBackupResult::LocalOnly { changed: false }
+        );
+        let tracked = run_git(&directory, &["ls-files"]).unwrap();
+        assert!(tracked.stdout.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn git_backup_nests_safely_instead_of_staging_a_parent_repository() {
+        if !git_available() {
+            return;
+        }
+        let parent = test_directory("git-parent");
+        let writing = parent.join("Writing");
+        atomic_write(&writing.join("Notes/note.md"), b"safe").unwrap();
+        git_success(&parent, &["init", "--quiet"], "initialize test repository").unwrap();
+        assert_eq!(
+            git_backup(&writing, &writing.join("missing.lock")).unwrap(),
+            GitBackupResult::LocalOnly { changed: true }
+        );
+        assert!(writing.join(".git").exists());
+        let parent_index = run_git(&parent, &["ls-files"]).unwrap();
+        assert!(parent_index.stdout.is_empty());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn git_backup_pushes_to_an_existing_origin_without_force() {
+        if !git_available() {
+            return;
+        }
+        let root = test_directory("git-origin");
+        let writing = root.join("Writing");
+        let remote = root.join("remote.git");
+        fs::create_dir_all(&writing).unwrap();
+        fs::create_dir_all(&remote).unwrap();
+        git_success(
+            &remote,
+            &["init", "--bare", "--quiet"],
+            "initialize test remote",
+        )
+        .unwrap();
+        ensure_git_repository(&writing).unwrap();
+        let remote_text = remote.to_string_lossy().into_owned();
+        git_success(
+            &writing,
+            &["remote", "add", "origin", &remote_text],
+            "add test origin",
+        )
+        .unwrap();
+        atomic_write(&writing.join("Notes/note.md"), b"off-device copy").unwrap();
+        assert_eq!(
+            git_backup(&writing, &writing.join("missing.lock")).unwrap(),
+            GitBackupResult::Pushed
+        );
+        let remote_head = run_git(&remote, &["rev-parse", "HEAD"]).unwrap();
+        assert!(remote_head.status.success());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn secret_lock_backup_restores_recovery_metadata() {
+        let directory = test_directory("git-lock-restore");
+        let source = directory.join("source.lock");
+        let restored = directory.join("config/secret.lock");
+        create_secret_lock(&source, b"a strong sample password").unwrap();
+        backup_secret_lock(&directory, &source).unwrap();
+        restore_secret_lock_backup(&directory, &restored).unwrap();
+        assert_eq!(fs::read(source).unwrap(), fs::read(restored).unwrap());
         fs::remove_dir_all(directory).unwrap();
     }
 }
